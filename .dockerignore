@@ -1,0 +1,16 @@
+.env
+.git
+.gitignore
+.pytest_cache
+.venv
+__pycache__
+*.py[cod]
+*.db
+*.sqlite3
+.pio
+firmware/.pio
+dashboard/node_modules
+dashboard/dist
+node_modules
+build
+dist

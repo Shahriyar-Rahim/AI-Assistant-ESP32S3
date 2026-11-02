@@ -1,0 +1,4 @@
+-r requirements.txt
+resemblyzer>=0.1.4,<1
+cryptography>=43,<47
+numpy>=1.26,<3

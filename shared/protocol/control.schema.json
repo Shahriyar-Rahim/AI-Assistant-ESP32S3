@@ -1,0 +1,25 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://distributed-edge-ai-assistant.local/protocol/control-v1.schema.json",
+  "title": "Assistant control message",
+  "type": "object",
+  "required": ["protocol_version", "message_id", "device_id", "timestamp", "type", "payload"],
+  "properties": {
+    "protocol_version": { "const": 1 },
+    "message_id": { "type": "string", "minLength": 1, "maxLength": 64 },
+    "device_id": { "type": "string", "minLength": 1, "maxLength": 128 },
+    "timestamp": { "type": "string", "format": "date-time" },
+    "type": {
+      "enum": [
+        "device.hello", "device.status", "audio.start", "audio.end",
+        "audio.vad", "audio.wake_word", "audio.transcription",
+        "biometric.result", "assistant.response", "tts.start", "tts.end",
+        "display.state", "animation.state", "sound.effect", "device.brightness",
+        "device.microphone", "ota.status", "calendar.notification",
+        "game.state", "weather.alert", "device.error", "ping", "pong"
+      ]
+    },
+    "payload": { "type": "object" }
+  },
+  "additionalProperties": false
+}
