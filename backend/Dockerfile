@@ -4,12 +4,13 @@ ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
 
 WORKDIR /app
 
-# 1. Install system-level C/C++ libraries FIRST so pip packages build cleanly
+# 1. Install system dependencies (libgl1 replaces libgl1-mesa-glx)
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     ffmpeg \
     espeak-ng \
-    libgl1-mesa-glx \
+    libgl1 \
+    libglx-mesa0 \
     libglib2.0-0 \
     portaudio19-dev \
     && rm -rf /var/lib/apt/lists/*
@@ -27,5 +28,5 @@ COPY backend/ .
 
 EXPOSE 8000
 
-# 5. Execute DB migrations and start FastAPI using Render's dynamic $PORT environment variable
+# 5. Run database migrations and launch FastAPI
 CMD ["sh", "-c", "alembic -c alembic.ini upgrade head && uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8000}"]
