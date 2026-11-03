@@ -16,18 +16,19 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
     && rm -rf /var/lib/apt/lists/*
 
-# 2. Copy and install requirements
+# 2. Copy requirement files
 COPY backend/requirements.txt ./requirements.txt
 COPY backend/requirements-wakeword.txt ./requirements-wakeword.txt
 
+# 3. Install dependencies including tqdm and requests, then openwakeword without tflite-runtime
 RUN pip install --no-cache-dir -r requirements.txt \
-    && pip install --no-cache-dir onnxruntime scikit-learn \
+    && pip install --no-cache-dir onnxruntime scikit-learn tqdm requests \
     && pip install --no-cache-dir --no-deps openwakeword>=0.6.0
 
-# 3. Download base models cleanly via Python
+# 4. Download base models cleanly
 RUN python -c "import openwakeword; openwakeword.utils.download_models()"
 
-# 4. Copy backend source files
+# 5. Copy backend source files into /app
 COPY backend/ .
 
 EXPOSE 8000
