@@ -1,10 +1,10 @@
-FROM python:3.12-slim
+FROM python:3.11-slim
 
 ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
 
 WORKDIR /app
 
-# 1. Install system-level C/C++ libraries FIRST
+# 1. Install system dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     ffmpeg \
@@ -13,24 +13,23 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libglx-mesa0 \
     libglib2.0-0 \
     portaudio19-dev \
+    curl \
     && rm -rf /var/lib/apt/lists/*
 
-# 2. Copy requirement files
+# 2. Copy and install requirements
 COPY backend/requirements.txt ./requirements.txt
 COPY backend/requirements-wakeword.txt ./requirements-wakeword.txt
 
-# 3. Install core dependencies, then install openwakeword bypassing tflite-runtime check
 RUN pip install --no-cache-dir -r requirements.txt \
     && pip install --no-cache-dir onnxruntime scikit-learn \
     && pip install --no-cache-dir --no-deps openwakeword>=0.6.0
 
-# 4. Pre-download openwakeword models
-RUN python -c "from openwakeword.utils import download_models; download_models(model_names=['hey_buddy'])"
+# 3. Download base models cleanly via Python
+RUN python -c "import openwakeword; openwakeword.utils.download_models()"
 
-# 5. Copy backend source code into /app
+# 4. Copy backend source files
 COPY backend/ .
 
 EXPOSE 8000
 
-# 6. Run database migrations and launch FastAPI
 CMD ["sh", "-c", "alembic -c alembic.ini upgrade head && uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8000}"]
