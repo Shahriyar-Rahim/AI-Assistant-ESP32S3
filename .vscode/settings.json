@@ -17,5 +17,6 @@
       "matchCommandLine": true
     }
   },
-  "cmake.sourceDirectory": "/mnt/New_Volume/Project_Files/ESP/Assistant/firmware"
+  "cmake.sourceDirectory": "/mnt/New_Volume/Project_Files/ESP/Assistant/firmware",
+  "python.terminal.useEnvFile": true
 }

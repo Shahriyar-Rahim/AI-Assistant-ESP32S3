@@ -70,11 +70,15 @@ def test_due_calendar_items_create_notifications_without_audio_storage(tmp_path)
         db.add(Reminder(title="Water plants", due_at=now - timedelta(seconds=1), timezone_name="UTC"))
         db.add(CalendarEvent(title="Stand-up", kind="meeting", start_at=now - timedelta(seconds=1),
                              timezone_name="UTC", description=""))
+        db.add(CalendarEvent(title="Wake-up", kind="alarm", start_at=now - timedelta(seconds=1),
+                             timezone_name="UTC", description=""))
         db.commit()
     application = SimpleNamespace(state=SimpleNamespace(db_factory=session_factory, settings=settings))
     pending = process_due_notifications(application)
-    assert len(pending) == 2
+    assert len(pending) == 3
     with session_factory() as db:
-        assert db.query(Notification).count() == 2
-        assert all(row.title in {"Water plants", "Stand-up"} for row in db.query(Notification).all())
+        assert db.query(Notification).count() == 3
+        assert {row.title for row in db.query(Notification).all()} == {"Water plants", "Stand-up", "Wake-up"}
+        alarm = next(row for row in db.query(Notification).all() if row.title == "Wake-up")
+        assert alarm.payload == {"kind": "alarm", "timezone_name": "UTC"}
     engine.dispose()

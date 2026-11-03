@@ -10,20 +10,29 @@ These external dependencies are required to exercise live provider-backed featur
 | Google Gemini | Google AI API key with access to selected models. Gmail OAuth is separate. |
 | Ollama | Running Ollama service and reachable base URL/model; no cloud API key for local use. |
 | Local Whisper/STT | A local Whisper adapter is not implemented. Compatible model files and sufficient host compute/storage would be required if added; Bengali support depends on the selected model. |
-| TTS | OpenAI PCM TTS adapter is implemented; key/model access is required. |
+| TTS | Set `TTS_PROVIDER=openai` for configured OpenAI PCM TTS with local eSpeak NG fallback, or `TTS_PROVIDER=local` to stay offline. Local mode uses the configured English/Bengali language and requires the eSpeak NG engine; the Docker image installs it, while native hosts must install it separately. `TTS_MODEL` and `TTS_VOICE` configure the OpenAI adapter. |
 | Gmail | Google Cloud OAuth client ID/secret, Gmail API enabled, OAuth consent configuration, and least-privilege granted scopes. Never use a Gmail account password. |
 | GitHub | Personal access token with the repository/notification permissions required for configured operations; encrypt stored credentials with `INTEGRATION_ENCRYPTION_KEY` and respect GitHub rate limits. |
 | LinkedIn | Approved LinkedIn application/product access, OAuth client credentials, redirect URI, and granted OpenID Connect scopes. The integration only exposes the supported member profile; do not scrape or infer inaccessible account data. |
 | Weather | The implemented weather client uses Open-Meteo's public geocoding/forecast APIs and needs no API key; observe service usage terms. |
 | Voice biometrics | Install `backend/requirements-voice.txt`, configure a generated Fernet `VOICE_ENCRYPTION_KEY`, and obtain/cache Resemblyzer model weights. Similarity is not liveness; the current endpoint explicitly reports anti-spoofing as unconfigured. |
-| Wake-word activation | Install `backend/requirements-wakeword.txt` and provide an ONNX wake-word model trained for the configured phrase (`hey buddy` by default) via `WAKE_WORD_MODEL_PATH`; other wake labels are deliberately ignored. The model artifact is not included. |
+| Wake-word activation | Install `backend/requirements-wakeword.txt`, download OpenWakeWord's separate feature/VAD assets as described below, and provide an ONNX wake-word model trained for the configured phrase (`hey buddy` by default) via `WAKE_WORD_MODEL_PATH`; other wake labels are deliberately ignored. The custom model artifact is not included. |
 | Encrypted personalization | Set `VOICE_ENCRYPTION_KEY` to a generated Fernet key. The user must explicitly enable personalization in the dashboard; then verified PCM/transcripts are encrypted and retained for the configured 1–90 days (30 by default), with deletion controls. |
 | Production device backend | Deploy the FastAPI service on a public DNS name with TLS/WSS. The provided `buddyapi.no-idea.top` hostname did not resolve from this development environment; confirm DNS and service deployment before provisioning the ESP32. |
 | Local Whisper STT | Install `backend/requirements-local-whisper.txt` and provision the Faster-Whisper model weights; download/runtime behavior depends on model choice and available device resources. |
 | Voice liveness/anti-spoofing | Provide a compatible, trained ONNX model via `ANTI_SPOOF_MODEL_PATH` and validate its bona-fide class/threshold against real speakers and replay/spoof samples. The command gate fails closed when the model is unavailable. |
 | Firmware OTA | Configure a trusted HTTPS backend URL, registered device bearer credential, matching `hardware_target`, and uploaded ESP image. The device checks SHA-256 against the authenticated manifest; publisher-signature verification is not implemented. OTA transfer and dual-slot rollback compile but have not been exercised on hardware. |
 | Shared rate limiting | Configure Redis using `REDIS_URL` for cross-process rate enforcement. If Redis is unavailable, the application logs the condition and falls back to process-local limits, which do not coordinate across workers. |
-| Physical device | ESP32-S3 N16R8, INMP441, MAX98357A, speaker, selected display, appropriate power, flashing, and electrical/acoustic validation. None were available for this software run. |
+| Physical device | ESP32-S3 N16R8 is attached over USB and the latest firmware was flashed successfully. Boot logs confirm I2S startup, microphone sample capture, Wi-Fi association, and automatic ST7735 selection. The board targets backend `192.168.10.163` on `192.168.10.0/24`, but the host is now `192.168.1.107/24`; LAN health and WebSocket attempts time out until both are on a mutually reachable network and the device URL is current. Sustained streaming, wake recognition, audible speaker output, panel rendering, OTA rollback, and electrical/acoustic validation remain unverified. |
 | Firmware time and TLS | Device network access to DNS and `pool.ntp.org` is used for clock synchronization before TLS WebSocket setup; `wss://` uses the ESP-IDF certificate bundle. Local `ws://` is unencrypted and suitable only on a trusted network. |
 
 OAuth/API features still require live credentials, scopes, account approvals, and external verification; follow the remaining items in [`../IMPLEMENTATION_STATUS.md`](../IMPLEMENTATION_STATUS.md). LinkedIn is restricted to the implemented authorized OpenID profile endpoint; messaging and analytics are not claimed or scraped.
+
+OpenWakeWord's feature models (`melspectrogram.onnx` and `embedding_model.onnx`) and VAD model are separate from the configured custom wake-word model. After installing `requirements-wakeword.txt`, download these support assets once from the `backend/` directory:
+
+```sh
+cd backend
+.venv/bin/python -c "from openwakeword.utils import download_models; download_models(model_names=['hey_buddy'])"
+```
+
+This fetches OpenWakeWord's shared support assets; it does not supply the custom `hey_buddy.onnx` model. Keep `WAKE_WORD_MODEL_PATH` configured for that model and start Uvicorn from `backend/` when using a relative path such as `./app/models/hey_buddy.onnx`.

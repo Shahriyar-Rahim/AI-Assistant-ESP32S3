@@ -476,7 +476,7 @@ def mark_notification(
     notification_id: str,
     body: NotificationUpdate,
     request: Request,
-    _: User = Depends(require_user),
+    user: User = Depends(require_user),
 ) -> dict[str, object]:
     with request.app.state.db_factory() as db:
         notification = db.get(Notification, notification_id)
@@ -484,7 +484,9 @@ def mark_notification(
             raise HTTPException(404, "notification not found")
         notification.delivered = body.delivered
         db.commit()
-        return {"id": notification.id, "delivered": notification.delivered}
+        result = {"id": notification.id, "delivered": notification.delivered}
+    _audit(request, user.id, "notification.delivery_state_updated", result)
+    return result
 
 
 @router.get("/calendar/export.csv")

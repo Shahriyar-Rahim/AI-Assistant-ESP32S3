@@ -1,9 +1,12 @@
 #include "audio_i2s.h"
+#include "esp_heap_caps.h"
+#include "freertos/idf_additions.h"
 
 #include <algorithm>
 #include <array>
 #include <atomic>
 #include <cmath>
+#include <cstring>
 
 #include "hardware_config.h"
 #include "driver/i2s_std.h"
@@ -18,7 +21,13 @@ QueueHandle_t pcm_queue = nullptr;
 QueueHandle_t playback_queue = nullptr;
 std::atomic_bool capture_enabled{true};
 std::atomic_bool startup_sound_active{false};
-constexpr TickType_t AMPLIFIER_IDLE_TIMEOUT = pdMS_TO_TICKS(250);
+constexpr UBaseType_t CAPTURE_QUEUE_BLOCKS = 100;
+constexpr UBaseType_t PLAYBACK_QUEUE_BLOCKS = 250;
+constexpr TickType_t AMPLIFIER_IDLE_TIMEOUT = pdMS_TO_TICKS(600);
+constexpr UBaseType_t PLAYBACK_PREBUFFER_BLOCKS = 12;
+constexpr TickType_t PLAYBACK_PREBUFFER_MAX_WAIT = pdMS_TO_TICKS(400);
+constexpr TickType_t CAPTURE_BLOCK_PERIOD = pdMS_TO_TICKS(
+    HardwareConfig::Audio::CAPTURE_SAMPLES * 1000 / HardwareConfig::Audio::SAMPLE_RATE);
 constexpr size_t STARTUP_TAIL_SAMPLES = HardwareConfig::Audio::SAMPLE_RATE / 10;
 
 esp_err_t set_amplifier_enabled(bool enabled) {
@@ -28,8 +37,16 @@ esp_err_t set_amplifier_enabled(bool enabled) {
 void capture_task(void*) {
     int32_t raw[HardwareConfig::Audio::CAPTURE_SAMPLES] = {};
     TickType_t last_overflow_log = 0;
+    TickType_t last_empty_read_log = 0;
+    TickType_t last_capture_wake = xTaskGetTickCount();
+    TickType_t last_audio_diagnostic = xTaskGetTickCount();
     uint32_t dropped_blocks = 0;
+    uint32_t empty_reads = 0;
+    uint64_t captured_square_sum = 0;
+    uint32_t captured_sample_count = 0;
+    uint16_t captured_peak = 0;
     while (true) {
+        last_capture_wake = xTaskGetTickCount();
         if (!capture_enabled.load()) {
             vTaskDelay(pdMS_TO_TICKS(50));
             continue;
@@ -44,11 +61,46 @@ void capture_task(void*) {
             continue;
         }
         if (!capture_enabled.load()) continue;
+        if (bytes_read == 0 || bytes_read % sizeof(raw[0]) != 0 ||
+            bytes_read > sizeof(raw)) {
+            ++empty_reads;
+            const TickType_t now = xTaskGetTickCount();
+            if (now - last_empty_read_log >= pdMS_TO_TICKS(5000)) {
+                ESP_LOGW(TAG, "I2S microphone returned invalid data %lu times (bytes=%u)",
+                    static_cast<unsigned long>(empty_reads), static_cast<unsigned>(bytes_read));
+                empty_reads = 0;
+                last_empty_read_log = now;
+            }
+            vTaskDelayUntil(&last_capture_wake, CAPTURE_BLOCK_PERIOD);
+            continue;
+        }
         AudioI2S::PcmBlock block{};
         const size_t count = bytes_read / sizeof(raw[0]);
         block.sample_count = static_cast<uint16_t>(count);
         for (size_t i = 0; i < count; ++i) {
-            block.samples[i] = static_cast<int16_t>(raw[i] >> 16);
+            // INMP441 speech at normal distance is quiet; a 4x saturating gain brings it into the range wake models expect.
+            block.samples[i] = static_cast<int16_t>(std::clamp<int32_t>(raw[i] >> 15, INT16_MIN, INT16_MAX));
+            const int32_t sample = block.samples[i];
+            const uint32_t magnitude = static_cast<uint32_t>(sample < 0 ? -sample : sample);
+            captured_square_sum += static_cast<uint64_t>(magnitude) * magnitude;
+            captured_peak = static_cast<uint16_t>(std::max<uint32_t>(captured_peak, magnitude));
+        }
+        captured_sample_count += static_cast<uint32_t>(count);
+        const TickType_t capture_now = xTaskGetTickCount();
+        if (capture_now - last_audio_diagnostic >= pdMS_TO_TICKS(5000)) {
+            const uint32_t rms = captured_sample_count == 0
+                ? 0
+                : static_cast<uint32_t>(std::sqrt(
+                    static_cast<double>(captured_square_sum) / captured_sample_count));
+            ESP_LOGI(
+                TAG, "Microphone capture: rms=%lu peak=%u samples=%lu queued_blocks=%u",
+                static_cast<unsigned long>(rms), static_cast<unsigned>(captured_peak),
+                static_cast<unsigned long>(captured_sample_count),
+                static_cast<unsigned>(uxQueueMessagesWaiting(pcm_queue)));
+            captured_square_sum = 0;
+            captured_sample_count = 0;
+            captured_peak = 0;
+            last_audio_diagnostic = capture_now;
         }
         if (xQueueSend(pcm_queue, &block, 0) != pdTRUE) {
             ++dropped_blocks;
@@ -65,7 +117,7 @@ void capture_task(void*) {
                 last_overflow_log = now;
             }
         }
-        vTaskDelay(1);
+        vTaskDelayUntil(&last_capture_wake, CAPTURE_BLOCK_PERIOD);
     }
 }
 
@@ -95,6 +147,12 @@ void playback_task(void*) {
             }
             amplifier_enabled = true;
             vTaskDelay(pdMS_TO_TICKS(2));
+            // Jitter buffer: let the network deliver ahead before starting so the speech does not stutter.
+            const TickType_t prebuffer_started = xTaskGetTickCount();
+            while (uxQueueMessagesWaiting(playback_queue) < PLAYBACK_PREBUFFER_BLOCKS &&
+                   xTaskGetTickCount() - prebuffer_started < PLAYBACK_PREBUFFER_MAX_WAIT) {
+                vTaskDelay(pdMS_TO_TICKS(10));
+            }
         }
         size_t bytes_written = 0;
         const esp_err_t result = i2s_channel_write(
@@ -127,8 +185,9 @@ esp_err_t initialize() {
     result = set_amplifier_enabled(false);
     if (result != ESP_OK) return result;
 
-    pcm_queue = xQueueCreate(8, sizeof(PcmBlock));
-    playback_queue = xQueueCreate(8, sizeof(PcmBlock));
+    // PSRAM-backed queues absorb Wi-Fi stalls (capture, ~2 s) and bursty TTS delivery (playback, ~5 s).
+    pcm_queue = xQueueCreateWithCaps(CAPTURE_QUEUE_BLOCKS, sizeof(PcmBlock), MALLOC_CAP_SPIRAM);
+    playback_queue = xQueueCreateWithCaps(PLAYBACK_QUEUE_BLOCKS, sizeof(PcmBlock), MALLOC_CAP_SPIRAM);
     if (pcm_queue == nullptr || playback_queue == nullptr) return ESP_ERR_NO_MEM;
 
     i2s_chan_config_t rx_config = I2S_CHANNEL_DEFAULT_CONFIG(
@@ -192,6 +251,64 @@ esp_err_t initialize() {
     return ESP_OK;
 }
 
+esp_err_t queue_sound_effect(const char* effect) {
+    if (effect == nullptr || playback_queue == nullptr) return ESP_ERR_INVALID_ARG;
+    struct Tone {
+        uint16_t frequency;
+        uint8_t blocks;
+    };
+    std::array<Tone, 3> tones{};
+    size_t tone_count = 0;
+    if (std::strcmp(effect, "wake") == 0) {
+        tones = {{{880, 8}, {1175, 8}, {0, 0}}};
+        tone_count = 2;
+    } else if (std::strcmp(effect, "success") == 0) {
+        tones = {{{660, 8}, {880, 12}, {0, 0}}};
+        tone_count = 2;
+    } else if (std::strcmp(effect, "error") == 0) {
+        tones = {{{260, 15}, {0, 0}, {0, 0}}};
+        tone_count = 1;
+    } else if (std::strcmp(effect, "move") == 0) {
+        tones = {{{740, 8}, {0, 0}, {0, 0}}};
+        tone_count = 1;
+    } else if (std::strcmp(effect, "notification") == 0) {
+        tones = {{{988, 8}, {784, 8}, {0, 0}}};
+        tone_count = 2;
+    } else if (std::strcmp(effect, "online") == 0) {
+        tones = {{{523, 8}, {659, 8}, {784, 12}}};
+        tone_count = 3;
+    } else {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    constexpr size_t BLOCK_SAMPLES = HardwareConfig::Audio::CAPTURE_SAMPLES;
+    constexpr double PI = 3.14159265358979323846;
+    constexpr int16_t AMPLITUDE = 9000;
+    uint64_t phase_sample = 0;
+    for (size_t tone_index = 0; tone_index < tone_count; ++tone_index) {
+        std::array<int16_t, BLOCK_SAMPLES> samples{};
+        const Tone tone = tones[tone_index];
+        for (uint8_t block_index = 0; block_index < tone.blocks; ++block_index) {
+            for (size_t sample_index = 0; sample_index < BLOCK_SAMPLES; ++sample_index) {
+                const double phase = tone.frequency == 0
+                    ? 0
+                    : 2.0 * PI * tone.frequency * phase_sample /
+                        HardwareConfig::Audio::SAMPLE_RATE;
+                samples[sample_index] = tone.frequency == 0
+                    ? 0
+                    : static_cast<int16_t>(AMPLITUDE * std::sin(phase));
+                ++phase_sample;
+            }
+            const esp_err_t result = queue_playback(samples.data(), samples.size());
+            if (result != ESP_OK) {
+                ESP_LOGW(TAG, "Cannot queue '%s' sound effect: %s", effect, esp_err_to_name(result));
+                return result;
+            }
+        }
+    }
+    return ESP_OK;
+}
+
 esp_err_t play_startup_sound(uint32_t duration_ms) {
     if (tx_channel == nullptr || duration_ms == 0 || duration_ms > 10'000) {
         return ESP_ERR_INVALID_ARG;
@@ -200,7 +317,7 @@ esp_err_t play_startup_sound(uint32_t duration_ms) {
 
     constexpr double PI = 3.14159265358979323846;
     constexpr double FREQUENCY_HZ = 660.0;
-    constexpr int16_t AMPLITUDE = 6000;
+    constexpr int16_t AMPLITUDE = 9000;
     constexpr size_t BLOCK_SAMPLES = HardwareConfig::Audio::CAPTURE_SAMPLES;
     const uint64_t total_samples =
         static_cast<uint64_t>(HardwareConfig::Audio::SAMPLE_RATE) * duration_ms / 1000;
@@ -281,7 +398,7 @@ esp_err_t play_startup_sound(uint32_t duration_ms) {
     result = set_amplifier_enabled(false);
     startup_sound_active.store(false);
     if (result != ESP_OK) return result;
-    ESP_LOGI(TAG, "Two-second startup sound played through I2S1");
+    ESP_LOGI(TAG, "Startup beep played through I2S1");
     return ESP_OK;
 }
 

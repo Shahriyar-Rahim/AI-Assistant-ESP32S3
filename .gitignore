@@ -19,3 +19,6 @@ dashboard/coverage/
 *.bin
 *.elf
 *.map
+backend/voices/
+backend/data/
+data/

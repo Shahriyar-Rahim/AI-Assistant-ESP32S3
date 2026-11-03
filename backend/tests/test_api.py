@@ -64,6 +64,80 @@ def test_websocket_requires_auth_and_device_hello(tmp_path) -> None:
             assert websocket.receive_json()["payload"]["connected"] is True
 
 
+def test_firmware_boot_hello_triggers_one_boot_greeting(tmp_path, monkeypatch) -> None:
+    import app.websocket.device as device_websocket
+
+    greeted = threading.Event()
+
+    async def fake_greeting(*_args) -> None:
+        greeted.set()
+
+    monkeypatch.setattr(device_websocket, "speak_online_greeting", fake_greeting)
+    settings = Settings(
+        database_url=f"sqlite:///{tmp_path / 'boot-greeting.db'}",
+        device_token="device-test",
+        simulator_token="sim-test",
+        allowed_origins=(),
+        max_audio_frame_bytes=4096,
+        vad_rms_threshold=450,
+        vad_end_silence_ms=900,
+        auth_signing_secret="test-signing-secret-that-is-long-enough",
+        bootstrap_admin_username="admin",
+        bootstrap_admin_password="test-password-that-is-long",
+    )
+    with TestClient(create_app(settings)) as client:
+        with client.websocket_connect(
+            "/api/v1/ws/devices/esp32/audio",
+            headers={"Authorization": "Bearer device-test"},
+        ) as websocket:
+            websocket.send_json({
+                "protocol_version": 1,
+                "message_id": "boot-123",
+                "device_id": "esp32",
+                "timestamp": "2026-01-01T00:00:00Z",
+                "type": "device.hello",
+                "payload": {},
+            })
+            assert websocket.receive_json()["type"] == "device.status"
+            assert greeted.wait(timeout=1)
+
+
+def test_missing_wake_word_model_keeps_audio_stream_available(tmp_path) -> None:
+    settings = Settings(
+        database_url=f"sqlite:///{tmp_path / 'missing-wake-model.db'}",
+        device_token="device-test",
+        simulator_token="sim-test",
+        allowed_origins=(),
+        max_audio_frame_bytes=4096,
+        vad_rms_threshold=450,
+        vad_end_silence_ms=900,
+        auth_signing_secret="test-signing-secret-that-is-long-enough",
+        bootstrap_admin_username="admin",
+        bootstrap_admin_password="test-password-that-is-long",
+        wake_word_model_path=str(tmp_path / "missing.onnx"),
+    )
+    with TestClient(create_app(settings)) as client:
+        with client.websocket_connect(
+            "/api/v1/ws/devices/esp32/audio",
+            headers={"Authorization": "Bearer device-test"},
+        ) as websocket:
+            websocket.send_json({
+                "protocol_version": 1,
+                "message_id": "hello",
+                "device_id": "esp32",
+                "timestamp": "2026-01-01T00:00:00Z",
+                "type": "device.hello",
+                "payload": {},
+            })
+            assert websocket.receive_json()["payload"]["code"] == "wake_word_unavailable"
+            assert websocket.receive_json()["payload"]["connected"] is True
+            websocket.receive_json()
+            websocket.send_bytes(encode_frame(AudioFrame(
+                0, 1, 16_000, 320, 1, bytes(640),
+            )))
+            assert websocket.receive_json()["type"] == "audio.ack"
+
+
 def test_authenticated_websocket_streams_pcm_vad_and_ping(tmp_path) -> None:
     settings = Settings(
         database_url=f"sqlite:///{tmp_path / 'stream.db'}",
@@ -133,6 +207,57 @@ def test_authenticated_websocket_streams_pcm_vad_and_ping(tmp_path) -> None:
                 received = websocket.receive_json()
                 if received["type"] == "pong":
                     break
+
+
+def test_audio_gap_replays_missing_frame_and_acks_accepted_audio(tmp_path) -> None:
+    settings = Settings(
+        database_url=f"sqlite:///{tmp_path / 'audio-replay.db'}",
+        device_token="device-test",
+        simulator_token="sim-test",
+        allowed_origins=(),
+        max_audio_frame_bytes=4096,
+        vad_rms_threshold=400,
+        vad_end_silence_ms=40,
+        auth_signing_secret="test-signing-secret-that-is-long-enough",
+        bootstrap_admin_username="admin",
+        bootstrap_admin_password="test-password-that-is-long",
+    )
+    with TestClient(create_app(settings)) as client:
+        with client.websocket_connect(
+            "/api/v1/ws/devices/test/audio",
+            headers={"Authorization": "Bearer device-test"},
+        ) as websocket:
+            websocket.send_json({
+                "protocol_version": 1,
+                "message_id": "hello",
+                "device_id": "test",
+                "timestamp": "2026-01-01T00:00:00Z",
+                "type": "device.hello",
+                "payload": {},
+            })
+            assert websocket.receive_json()["type"] == "device.status"
+            silent_pcm = bytes(640)
+
+            def send_frame(sequence: int) -> None:
+                websocket.send_bytes(encode_frame(AudioFrame(
+                    sequence, sequence + 1, 16_000, 320, 1, silent_pcm,
+                )))
+
+            send_frame(0)
+            send_frame(2)
+            while True:
+                message = websocket.receive_json()
+                if message["type"] == "audio.nack":
+                    assert message["payload"]["expected_sequence"] == 1
+                    break
+
+            send_frame(1)
+            send_frame(2)
+            accepted: set[int] = set()
+            while accepted != {1, 2}:
+                message = websocket.receive_json()
+                if message["type"] == "audio.ack":
+                    accepted.add(message["payload"]["sequence"])
 
 
 def test_slow_telemetry_client_does_not_block_audio_telemetry_producer() -> None:

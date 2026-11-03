@@ -1,12 +1,14 @@
 import { FormEvent, ReactNode, useEffect, useState } from "react";
 import { Link, Navigate, Route, Routes, useNavigate } from "react-router-dom";
 import { useQuery } from "@tanstack/react-query";
-import { Activity, CalendarDays, Cloud, Cpu, Gamepad2, Gauge, Monitor, PlugZap, Radio, Server, Shield, Smile, Upload, Wifi, WifiOff, Workflow } from "lucide-react";
+import { Activity, AlarmClock, Bell, CalendarDays, Cloud, Code2, Cpu, Gamepad2, Gauge, KeyRound, Monitor, PlugZap, Radio, Server, Settings, Shield, Smile, Upload, Wifi, WifiOff, Workflow } from "lucide-react";
 import { CartesianGrid, Line, LineChart, ResponsiveContainer, Tooltip, XAxis, YAxis } from "recharts";
 
 type Device = { device_id: string; name: string; connected: boolean; last_seen: string | null; simulated: boolean; config: Record<string, unknown> };
 type EventItem = { id: string; title: string; kind: string; description?: string; start_at: string; end_at: string | null; timezone_name: string; recurrence_rule?: string | null; completed: boolean };
 type GameSession = { session_id: string; game: string; version: number; status: string; state: Record<string, unknown> };
+type NotificationItem = { id: string; source_type: string; title: string; payload: Record<string, unknown>; delivered: boolean; created_at: string };
+type IntegrationAccount = { provider: "github" | "gmail" | "linkedin"; configured: boolean; credential_source: "environment" | "encrypted_storage" | null; scopes: string[]; connected_at: string | null };
 const apiBase = (import.meta.env.VITE_API_URL ?? "http://localhost:8000").replace(/\/$/, "");
 const tokenKey = "assistant-access-token";
 
@@ -61,12 +63,20 @@ function Shell({ children, onLogout }: { children: ReactNode; onLogout: () => vo
     { to: "/display", text: "Display studio", icon: <Smile size={16} /> },
     { to: "/ota", text: "Firmware OTA", icon: <Upload size={16} /> },
     { to: "/calendar", text: "Calendar", icon: <CalendarDays size={16} /> },
+    { to: "/alarms", text: "Alarms", icon: <AlarmClock size={16} /> },
     { to: "/games", text: "Mini-games", icon: <Gamepad2 size={16} /> },
+    { to: "/vision", text: "Camera", icon: <Shield size={16} /> },
+    { to: "/game-history", text: "Game history", icon: <Gauge size={16} /> },
+    { to: "/brain", text: "Local brain", icon: <Cpu size={16} /> },
     { to: "/ai", text: "AI provider", icon: <Activity size={16} /> },
     { to: "/voice", text: "Voice activity", icon: <Radio size={16} /> },
     { to: "/personalization", text: "Personalization", icon: <Activity size={16} /> },
     { to: "/biometric", text: "Voice security", icon: <Shield size={16} /> },
     { to: "/integrations", text: "Integrations", icon: <PlugZap size={16} /> },
+    { to: "/credentials", text: "Credentials", icon: <KeyRound size={16} /> },
+    { to: "/notifications", text: "Notifications", icon: <Bell size={16} /> },
+    { to: "/settings", text: "Settings", icon: <Settings size={16} /> },
+    { to: "/developer", text: "Developer tools", icon: <Code2 size={16} /> },
     { to: "/weather", text: "Weather", icon: <Cloud size={16} /> },
     { to: "/automation", text: "Automation", icon: <Workflow size={16} /> },
     { to: "/audit", text: "Audit logs", icon: <Shield size={16} /> },
@@ -126,6 +136,122 @@ function CalendarPage() {
     } catch (reason) { setError(reason instanceof Error ? reason.message : "Export failed"); }
   }
   return <><PageHeading eyebrow="SCHEDULE" title="Calendar" description="Events are stored as UTC instants with IANA timezone and recurrence rules." /><section className="panel"><div className="panel-heading"><div><h2>{editing ? "Edit event" : "Create event"}</h2><p>{editing ? "Update the selected event." : "Add an event to your schedule."}</p></div><button className="secondary" onClick={exportCsv}>Export CSV</button></div><form key={editing?.id ?? "new"} className="form-grid" onSubmit={createEvent}><label>Title<input name="title" required maxLength={200} defaultValue={editing?.title} /></label><label>Type<select name="kind" defaultValue={editing?.kind ?? "event"}><option value="event">Event</option><option value="meeting">Meeting</option><option value="birthday">Birthday</option><option value="function">Special function</option><option value="alarm">Alarm</option></select></label><label>Starts at<input name="start_at" type="datetime-local" required defaultValue={editing ? new Date(new Date(editing.start_at).getTime() - new Date().getTimezoneOffset() * 60000).toISOString().slice(0, 16) : undefined} /></label><label>Recurrence (RRULE)<input name="recurrence_rule" placeholder="FREQ=WEEKLY;COUNT=4" defaultValue={editing?.recurrence_rule ?? ""} /></label><button>{editing ? "Save changes" : "Create event"}</button>{editing && <button className="secondary" type="button" onClick={() => setEditing(null)}>Cancel edit</button>}</form>{error && <div className="alert error">{error}</div>}</section><section className="panel"><div className="panel-heading"><div><h2>Upcoming events</h2><p>{query.data?.total ?? 0} scheduled</p></div></div>{query.isError && <div className="alert error">{query.error.message}</div>}{query.data?.items.map((item) => <article className="event-row" key={item.id}><div><strong>{item.title}</strong><span>{item.kind} · {new Date(item.start_at).toLocaleString()} ({item.timezone_name})</span></div><div className="button-row"><button className="secondary" onClick={() => setEditing(item)}>Edit</button><button className="danger" onClick={() => removeEvent(item.id)}>Delete</button></div></article>)}</section><ReminderPanel onError={setError} /><TodoPanel onError={setError} /></>;
+}
+
+function AlarmsPage() {
+  const query = useQuery({
+    queryKey: ["events", "alarms"],
+    queryFn: () => fetchJson<{ items: EventItem[]; total: number }>("/api/v1/calendar/events?kind=alarm&limit=100"),
+  });
+  const [editing, setEditing] = useState<EventItem | null>(null);
+  const [error, setError] = useState("");
+  const [message, setMessage] = useState("");
+
+  async function saveAlarm(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    const form = event.currentTarget;
+    const values = new FormData(form);
+    try {
+      const payload = {
+        title: values.get("title"),
+        kind: "alarm",
+        start_at: new Date(String(values.get("start_at"))).toISOString(),
+        timezone_name: Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC",
+        recurrence_rule: values.get("recurrence_rule") || null,
+      };
+      await fetchJson(editing ? `/api/v1/calendar/events/${editing.id}` : "/api/v1/calendar/events", {
+        method: editing ? "PATCH" : "POST",
+        body: JSON.stringify(payload),
+      });
+      await query.refetch();
+      form.reset();
+      setEditing(null);
+      setError("");
+      setMessage(editing ? "Alarm updated." : "Alarm scheduled.");
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "Could not save alarm");
+    }
+  }
+
+  async function deleteAlarm(id: string) {
+    try {
+      await fetchJson(`/api/v1/calendar/events/${id}`, { method: "DELETE" });
+      await query.refetch();
+      setMessage("Alarm deleted.");
+      setError("");
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "Could not delete alarm");
+    }
+  }
+
+  return <><PageHeading eyebrow="SCHEDULE" title="Alarms" description="Create one-time or recurring alarms. Due alarms use the same persistent scheduler and device-notification delivery path as calendar reminders." />
+    <section className="panel"><div className="panel-heading"><div><h2>{editing ? "Edit alarm" : "Schedule an alarm"}</h2><p>Times are stored as UTC instants with your current IANA timezone.</p></div></div>
+      <form key={editing?.id ?? "new-alarm"} className="form-grid" onSubmit={saveAlarm}>
+        <label>Alarm name<input name="title" required maxLength={200} defaultValue={editing?.title} /></label>
+        <label>Time<input name="start_at" type="datetime-local" required defaultValue={editing ? new Date(new Date(editing.start_at).getTime() - new Date().getTimezoneOffset() * 60000).toISOString().slice(0, 16) : undefined} /></label>
+        <label>Recurrence (RRULE)<input name="recurrence_rule" placeholder="FREQ=DAILY;COUNT=7" defaultValue={editing?.recurrence_rule ?? ""} /></label>
+        <button><AlarmClock size={16} />{editing ? "Save alarm" : "Create alarm"}</button>
+        {editing && <button className="secondary" type="button" onClick={() => setEditing(null)}>Cancel edit</button>}
+      </form>
+      {message && <div className="response-box" role="status">{message}</div>}
+      {error && <div className="alert error" role="alert">{error}</div>}
+    </section>
+    <section className="panel"><div className="panel-heading"><div><h2>Scheduled alarms</h2><p>{query.data?.total ?? 0} alarms</p></div></div>
+      {query.isLoading && <div className="empty-state">Loading alarms…</div>}
+      {query.isError && <div className="alert error" role="alert">{query.error.message}</div>}
+      {!query.isLoading && !query.isError && query.data?.items.length === 0 && <div className="empty-state"><AlarmClock size={22} />No alarms scheduled.</div>}
+      {query.data?.items.map((alarm) => <article className="event-row" key={alarm.id}><div><strong>{alarm.title}</strong><span>{new Date(alarm.start_at).toLocaleString()} · {alarm.timezone_name}{alarm.recurrence_rule ? ` · ${alarm.recurrence_rule}` : ""}</span></div><div className="button-row"><button className="secondary" onClick={() => setEditing(alarm)}>Edit</button><button className="danger" onClick={() => void deleteAlarm(alarm.id)}>Delete</button></div></article>)}
+    </section>
+  </>;
+}
+
+function SettingsPage() {
+  const devices = useQuery({ queryKey: ["devices"], queryFn: () => fetchJson<{ devices: Device[] }>("/api/v1/devices") });
+  const [selected, setSelected] = useState("");
+  const [brightness, setBrightness] = useState(50);
+  const [microphoneEnabled, setMicrophoneEnabled] = useState(true);
+  const [error, setError] = useState("");
+  const [message, setMessage] = useState("");
+  const physicalDevices = devices.data?.devices.filter((device) => !device.simulated) ?? [];
+  const device = physicalDevices.find((item) => item.device_id === selected);
+
+  function chooseDevice(deviceId: string) {
+    setSelected(deviceId);
+    const selectedDevice = physicalDevices.find((item) => item.device_id === deviceId);
+    setBrightness(Number(selectedDevice?.config.brightness ?? 50));
+    setMicrophoneEnabled(selectedDevice?.config.microphone_enabled !== false);
+  }
+
+  async function saveSettings() {
+    if (!selected) return;
+    try {
+      await fetchJson(`/api/v1/devices/${encodeURIComponent(selected)}/config`, {
+        method: "PATCH",
+        body: JSON.stringify({ brightness, microphone_enabled: microphoneEnabled }),
+      });
+      await devices.refetch();
+      setMessage("Device settings saved.");
+      setError("");
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "Could not save device settings");
+    }
+  }
+
+  return <><PageHeading eyebrow="PREFERENCES" title="Device settings" description="Manage persisted per-device brightness and microphone uplink controls. Changes are applied live when connected and included in the next device status sync." />
+    <section className="panel"><div className="form-grid">
+      <label>Physical device<select value={selected} onChange={(event) => chooseDevice(event.target.value)}><option value="">Select a registered device</option>{physicalDevices.map((item) => <option key={item.device_id} value={item.device_id}>{item.name} · {item.device_id}</option>)}</select></label>
+      <label>Display brightness: {brightness}%<input type="range" min="0" max="100" value={brightness} disabled={!device} onChange={(event) => setBrightness(Number(event.target.value))} /></label>
+      <label>Microphone uplink<select value={microphoneEnabled ? "enabled" : "disabled"} disabled={!device} onChange={(event) => setMicrophoneEnabled(event.target.value === "enabled")}><option value="enabled">Enabled</option><option value="disabled">Disabled</option></select></label>
+      <button disabled={!device} onClick={() => void saveSettings()}><Settings size={16} />Save device settings</button>
+    </div>
+      {device && <p>{device.connected ? "Connected; controls are sent immediately." : "Offline; settings will apply on the next connection."}</p>}
+      {devices.isLoading && <div className="empty-state">Loading device settings…</div>}
+      {devices.isError && <div className="alert error" role="alert">{devices.error.message}</div>}
+      {message && <div className="response-box" role="status">{message}</div>}
+      {error && <div className="alert error" role="alert">{error}</div>}
+    </section>
+    <section className="panel"><h2>Backend connection</h2><p>Dashboard API origin: <code>{apiBase}</code></p><p>Device tokens and provider secrets are configured on the backend and are never stored in dashboard preferences.</p></section>
+  </>;
 }
 
 function DevicesPage() {
@@ -223,6 +349,52 @@ function GamesPage() {
     } catch (reason) { setError(reason instanceof Error ? reason.message : "Move failed"); }
   }
   return <><PageHeading eyebrow="PLAY" title="Mini-games" description="Game rules and state are authoritative on the backend." /><section className="game-picker">{[["tic_tac_toe", "Tic-Tac-Toe"], ["rock_paper_scissors", "Rock, Paper, Scissors"], ["number_guessing", "Number Guessing"], ["trivia", "Trivia"], ["hangman", "Hangman"], ["word_association", "Word Association"]].map(([id, name]) => <button key={id} className="game-card" onClick={() => start(id)}><Gamepad2 size={18} /><strong>{name}</strong><span>Start session</span></button>)}</section>{error && <div className="alert error">{error}</div>}{session && <section className="panel"><div className="panel-heading"><div><h2>{session.game.replaceAll("_", " ")}</h2><p>Session {session.session_id} · version {session.version} · {session.status}</p></div></div><GameControls session={session} onMove={move} /></section>}</>;
+}
+
+type GameResultRow = { id: string; game: string; outcome: string; score: number; max_score: number; rounds: number; duration_seconds: number; difficulty: string; device_id: string | null; simulated: boolean; finished_at: string };
+type GameStats = {
+  total_games: number; total_wins: number; summary: string;
+  games: Record<string, { played: number; wins: number; losses: number; draws: number; abandoned: number; win_rate: number | null; average_duration_seconds: number; best_score: number; streak: { kind: string | null; length: number }; recent_form: string[]; last_played: string }>;
+  patterns: { favorite: string | null; strongest: string | null; weakest: string | null; play_hours: number[]; suggested_difficulty: Record<string, string>; insights: string[] };
+};
+const gameLabel = (game: string) => game.replace(/_/g, " ").replace(/\b\w/g, (letter) => letter.toUpperCase());
+
+function GameHistoryPage() {
+  const [error, setError] = useState("");
+  const stats = useQuery({ queryKey: ["game-stats"], queryFn: () => fetchJson<GameStats>("/api/v1/games/stats"), refetchInterval: 5_000 });
+  const history = useQuery({ queryKey: ["game-history"], queryFn: () => fetchJson<{ results: GameResultRow[] }>("/api/v1/games/history?limit=100"), refetchInterval: 5_000 });
+  async function clear() {
+    if (!window.confirm("Delete all saved game history and learned play patterns?")) return;
+    try { await fetchJson<void>("/api/v1/games/history", { method: "DELETE" }); setError(""); await Promise.all([stats.refetch(), history.refetch()]); }
+    catch (reason) { setError(reason instanceof Error ? reason.message : "Could not clear history"); }
+  }
+  const data = stats.data;
+  const games = Object.entries(data?.games ?? {});
+  return <><PageHeading eyebrow="PLAY" title="Game history" description="Results of games played on the ESP32-S3. The assistant uses these patterns to adapt difficulty, recommend games, and answer questions about your play." />
+    {(stats.isError || history.isError) && <div className="alert error">Could not load game data.</div>}{error && <div className="alert error">{error}</div>}
+    <section className="metrics"><article className="metric-card"><div className="metric-icon purple"><Gamepad2 size={18} /></div><span>GAMES PLAYED</span><strong>{data?.total_games ?? "—"}</strong><small>All saved results</small></article><article className="metric-card"><div className="metric-icon green"><Gauge size={18} /></div><span>WINS</span><strong>{data?.total_wins ?? "—"}</strong><small>{data && data.total_games ? `${Math.round((data.total_wins / data.total_games) * 100)}% of games` : "No games yet"}</small></article><article className="metric-card"><div className="metric-icon blue"><Smile size={18} /></div><span>FAVORITE GAME</span><strong>{data?.patterns.favorite ? gameLabel(data.patterns.favorite) : "—"}</strong><small>{data?.patterns.play_hours.length ? `Usually played around ${data.patterns.play_hours.map((hour) => `${hour}:00`).join(", ")} UTC` : "Learns from your play"}</small></article></section>
+    <section className="panel"><div className="panel-heading"><div><h2>Learned patterns</h2><p>{data?.summary ?? "Loading…"}</p></div><button className="secondary" onClick={clear}>Clear history</button></div>{data?.patterns.insights.length ? <ul>{data.patterns.insights.map((insight) => <li key={insight}>{insight}</li>)}</ul> : <div className="empty-state">Play a game on the device to start learning your patterns.</div>}{data && Object.keys(data.patterns.suggested_difficulty).length > 0 && <p>Adaptive difficulty: {Object.entries(data.patterns.suggested_difficulty).map(([game, level]) => `${gameLabel(game)} → ${level}`).join(" · ")}</p>}</section>
+    <section className="panel"><div className="panel-heading"><div><h2>Per-game statistics</h2><p>Win rate, streaks and recent form.</p></div></div>{games.length ? <table className="data-table"><thead><tr><th>Game</th><th>Played</th><th>W / L / D</th><th>Win rate</th><th>Best score</th><th>Avg time</th><th>Streak</th><th>Recent</th></tr></thead><tbody>{games.map(([game, item]) => <tr key={game}><td>{gameLabel(game)}</td><td>{item.played}</td><td>{item.wins} / {item.losses} / {item.draws}</td><td>{item.win_rate === null ? "—" : `${Math.round(item.win_rate * 100)}%`}</td><td>{item.best_score}</td><td>{item.average_duration_seconds}s</td><td>{item.streak.kind ? `${item.streak.length} ${item.streak.kind}` : "—"}</td><td>{item.recent_form.join(" ")}</td></tr>)}</tbody></table> : <div className="empty-state">No finished games yet.</div>}</section>
+    <section className="panel"><div className="panel-heading"><div><h2>History</h2><p>Most recent 100 results.</p></div></div>{history.data?.results.length ? <table className="data-table"><thead><tr><th>When</th><th>Game</th><th>Outcome</th><th>Score</th><th>Rounds</th><th>Duration</th><th>Difficulty</th><th>Device</th></tr></thead><tbody>{history.data.results.map((row) => <tr key={row.id}><td>{new Date(row.finished_at).toLocaleString()}</td><td>{gameLabel(row.game)}</td><td>{row.outcome}</td><td>{row.max_score ? `${row.score}/${row.max_score}` : row.score}</td><td>{row.rounds}</td><td>{row.duration_seconds}s</td><td>{row.difficulty}</td><td>{row.device_id ?? "—"}{row.simulated ? " (SIMULATED)" : ""}</td></tr>)}</tbody></table> : <div className="empty-state">No history saved yet.</div>}</section></>;
+}
+
+function BrainPage() {
+  const [error, setError] = useState("");
+  type BrainRow = { id: string; kind: string; prompt: string; uses: number; source: string; answer: string };
+  const brain = useQuery({ queryKey: ["brain"], queryFn: () => fetchJson<{ entries: number; kinds: Record<string, number>; total_local_answers: number; local_first: boolean; runs_on: string; facts: { id: string; text: string }[]; top: BrainRow[]; recent: BrainRow[] }>("/api/v1/brain"), refetchInterval: 5_000 });
+  async function remove(path: string, confirmText?: string) {
+    if (confirmText && !window.confirm(confirmText)) return;
+    try { await fetchJson<unknown>(path, { method: "DELETE" }); setError(""); await brain.refetch(); }
+    catch (reason) { setError(reason instanceof Error ? reason.message : "Could not delete"); }
+  }
+  const data = brain.data;
+  const rows = (items: BrainRow[]) => <table className="data-table"><thead><tr><th>You said</th><th>Learned answer</th><th>Kind</th><th>Used</th><th /></tr></thead><tbody>{items.map((row) => <tr key={row.id}><td>{row.prompt}</td><td>{row.answer}</td><td>{row.kind} · {row.source}</td><td>{row.uses}</td><td><button className="secondary" onClick={() => remove(`/api/v1/brain/${row.id}`)}>Forget</button></td></tr>)}</tbody></table>;
+  return <><PageHeading eyebrow="LEARN" title="Local brain" description="A small retrieval brain that learns from you and from cloud AI answers, so common questions are answered without the cloud. It runs on the backend host, not on the ESP32-S3." />
+    {brain.isError && <div className="alert error">Could not load the local brain.</div>}{error && <div className="alert error">{error}</div>}
+    <section className="metrics"><article className="metric-card"><div className="metric-icon purple"><Cpu size={18} /></div><span>LEARNED ENTRIES</span><strong>{data?.entries ?? "—"}</strong><small>{Object.entries(data?.kinds ?? {}).map(([kind, count]) => `${kind}: ${count}`).join(" · ") || "Nothing learned yet"}</small></article><article className="metric-card"><div className="metric-icon green"><Gauge size={18} /></div><span>ANSWERED LOCALLY</span><strong>{data?.total_local_answers ?? "—"}</strong><small>{data?.local_first ? "Local-first enabled" : "Cloud-first"}</small></article></section>
+    <section className="panel"><div className="panel-heading"><div><h2>What I know about you</h2><p>Say “my name is…” or “remember that…” to the assistant.</p></div><button className="secondary" onClick={() => remove("/api/v1/brain", "Delete everything the local brain has learned?")}>Forget everything</button></div>{data?.facts.length ? <ul>{data.facts.map((fact) => <li key={fact.id}>{fact.text} <button className="secondary" onClick={() => remove(`/api/v1/brain/${fact.id}`)}>Forget</button></li>)}</ul> : <div className="empty-state">No personal facts saved yet.</div>}</section>
+    <section className="panel"><div className="panel-heading"><div><h2>Most used answers</h2></div></div>{data?.top.length ? rows(data.top) : <div className="empty-state">Ask the assistant questions; cloud answers are learned and reused.</div>}</section>
+    <section className="panel"><div className="panel-heading"><div><h2>Recently learned</h2></div></div>{data?.recent.length ? rows(data.recent) : <div className="empty-state">Nothing yet.</div>}</section></>;
 }
 
 function GameControls({ session, onMove }: { session: GameSession; onMove: (move: Record<string, unknown>) => void }) {
@@ -437,6 +609,138 @@ function IntegrationsPage() {
   </>;
 }
 
+function NotificationsPage() {
+  const query = useQuery({
+    queryKey: ["notifications"],
+    queryFn: () => fetchJson<{ items: NotificationItem[]; total: number }>("/api/v1/notifications?limit=100"),
+    refetchInterval: 30_000,
+  });
+  const [filter, setFilter] = useState<"all" | "pending" | "delivered">("all");
+  const [error, setError] = useState("");
+  const [message, setMessage] = useState("");
+  async function setDelivered(item: NotificationItem, delivered: boolean) {
+    try {
+      await fetchJson(`/api/v1/notifications/${item.id}`, {
+        method: "PATCH",
+        body: JSON.stringify({ delivered }),
+      });
+      await query.refetch();
+      setMessage(delivered ? "Notification marked as delivered." : "Notification marked as pending.");
+      setError("");
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "Could not update notification");
+    }
+  }
+  const items = (query.data?.items ?? []).filter((item) =>
+    filter === "all" || (filter === "delivered" ? item.delivered : !item.delivered),
+  );
+  return <><PageHeading eyebrow="ALERTS" title="Notification center" description="Review persisted calendar/reminder alerts and track their device-delivery state." />
+    <section className="panel"><div className="panel-heading"><div><h2>Notifications</h2><p>{query.data?.total ?? 0} records · {items.filter((item) => !item.delivered).length} pending in this view</p></div><label>Show<select value={filter} onChange={(event) => setFilter(event.target.value as typeof filter)}><option value="all">All</option><option value="pending">Pending</option><option value="delivered">Delivered</option></select></label></div><p>Changing this marker does not send or retry a device notification.</p>
+      {message && <div className="response-box" role="status">{message}</div>}
+      {error && <div className="alert error" role="alert">{error}</div>}
+      {query.isLoading && <div className="empty-state">Loading notifications…</div>}
+      {query.isError && <div className="alert error">{query.error.message}</div>}
+      {!query.isLoading && !query.isError && items.length === 0 && <div className="empty-state"><Bell size={22} />No notifications match this filter.</div>}
+      {items.map((item) => <article className="event-row" key={item.id}><div><strong>{item.title}</strong><span>{item.source_type} · {new Date(item.created_at).toLocaleString()} · {item.delivered ? "Delivered to device" : "Pending delivery"}</span></div><button className={item.delivered ? "secondary" : ""} onClick={() => void setDelivered(item, !item.delivered)}>{item.delivered ? "Mark pending" : "Mark delivered"}</button></article>)}
+    </section>
+  </>;
+}
+
+function CredentialsPage() {
+  const query = useQuery({
+    queryKey: ["integration-accounts"],
+    queryFn: () => fetchJson<{ accounts: IntegrationAccount[] }>("/api/v1/integrations/accounts"),
+  });
+  const [error, setError] = useState("");
+  const [message, setMessage] = useState("");
+  async function disconnect(account: IntegrationAccount) {
+    if (account.credential_source === "environment") return;
+    if (!window.confirm(`Remove the assistant's stored ${account.provider} credential? This does not revoke it at the provider.`)) return;
+    try {
+      await fetchJson(`/api/v1/integrations/${account.provider}/credentials`, { method: "DELETE" });
+      await query.refetch();
+      setMessage(`${account.provider} credential removed from assistant storage. Revoke the grant/token at the provider separately.`);
+      setError("");
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : `Could not remove ${account.provider} credentials`);
+    }
+  }
+  return <><PageHeading eyebrow="ACCESS CONTROL" title="Credential hub" description="Configuration metadata only; stored secrets remain encrypted on the backend and are never returned to the browser. Provider connectivity is not live-verified here." />
+    {message && <div className="response-box" role="status">{message}</div>}
+    {error && <div className="alert error" role="alert">{error}</div>}
+    {query.isError && <div className="alert error" role="alert">{query.error.message}</div>}
+    <section className="panel"><h2>Connected providers</h2><p>Removing a credential here deletes the assistant's stored copy. Provider-side tokens or consent grants must be revoked separately.</p>
+      {query.isLoading && <div className="empty-state">Loading credential status…</div>}
+      {query.data?.accounts.map((account) => <article className="event-row" key={account.provider}><div><strong>{account.provider}</strong><span>{account.configured ? `Credential configured · ${account.credential_source === "environment" ? "backend environment secret" : "encrypted storage"}` : "No credential stored"}{account.connected_at ? ` · stored ${new Date(account.connected_at).toLocaleString()}` : ""}{account.scopes.length ? ` · scopes: ${account.scopes.join(", ")}` : ""}</span></div>{account.configured && <button className="danger" disabled={account.credential_source === "environment"} onClick={() => void disconnect(account)}>{account.credential_source === "environment" ? "Managed by backend" : "Remove stored credential"}</button>}</article>)}
+    </section>
+  </>;
+}
+
+function DeveloperPage() {
+  const health = useQuery({ queryKey: ["developer-health"], queryFn: () => fetchJson<{ status: string }>("/api/v1/health"), refetchInterval: 10_000 });
+  const devices = useQuery({ queryKey: ["developer-devices"], queryFn: () => fetchJson<{ devices: Device[] }>("/api/v1/devices"), refetchInterval: 5_000 });
+  const [error, setError] = useState("");
+  const [message, setMessage] = useState("");
+  const [deviceId, setDeviceId] = useState("simulated-buddy");
+  const [simulatorToken, setSimulatorToken] = useState("");
+  const [scenario, setScenario] = useState("observe");
+  const shellQuote = (value: string) => `'${value.replaceAll("'", "'\\''")}'`;
+  const simulatorCommand = simulatorToken
+    ? `env BACKEND_URL=${shellQuote(apiBase)} DEVICE_ID=${shellQuote(deviceId)} SIMULATOR_TOKEN=${shellQuote(simulatorToken)} python simulator/device_simulator.py --scenario ${shellQuote(scenario)}`
+    : "";
+
+  async function copyDiagnostics() {
+    try {
+      await navigator.clipboard.writeText(JSON.stringify({
+        captured_at: new Date().toISOString(),
+        api_origin: apiBase,
+        health: health.data ?? null,
+        devices: devices.data?.devices.map(({ device_id, connected, simulated, last_seen }) => ({
+          device_id,
+          connected,
+          simulated,
+          last_seen,
+        })) ?? null,
+      }, null, 2));
+      setMessage("Current diagnostics copied. No credentials or audio are included.");
+      setError("");
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "Clipboard access is unavailable");
+    }
+  }
+
+  async function copySimulatorCommand() {
+    try {
+      await navigator.clipboard.writeText(simulatorCommand);
+      setMessage("SIMULATED command copied. It does not test physical hardware.");
+      setError("");
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "Clipboard access is unavailable");
+    }
+  }
+
+  return <><PageHeading eyebrow="DEVELOPMENT" title="Developer tools" description="Inspect live API/device state, open the generated API schema, and run explicitly simulated protocol scenarios." />
+    <section className="metrics"><article className="metric-card"><div className="metric-icon green"><Server size={18} /></div><span>BACKEND HEALTH</span><strong>{health.data?.status === "ok" ? "Healthy" : health.isLoading ? "Checking" : "Unavailable"}</strong><small>{apiBase}/api/v1/health</small></article><article className="metric-card"><div className="metric-icon blue"><Cpu size={18} /></div><span>PHYSICAL DEVICES</span><strong>{devices.data?.devices.filter((item) => !item.simulated).length ?? "—"}</strong><small>SIMULATED devices are excluded</small></article><article className="metric-card"><div className="metric-icon purple"><Radio size={18} /></div><span>CONNECTED PHYSICAL</span><strong>{devices.data?.devices.filter((item) => !item.simulated && item.connected).length ?? "—"}</strong><small>Authenticated WebSocket sessions</small></article></section>
+    <section className="panel"><div className="panel-heading"><div><h2>API reference</h2><p>Generated from the running backend; endpoints still enforce their configured authentication.</p></div><button className="secondary" onClick={() => void copyDiagnostics()}><Code2 size={16} />Copy diagnostics</button></div>
+      <div className="button-row"><a className="button-link" href={`${apiBase}/docs`} target="_blank" rel="noreferrer">Open API docs</a><a className="button-link secondary" href={`${apiBase}/openapi.json`} target="_blank" rel="noreferrer">Open OpenAPI JSON</a></div>
+      {health.isError && <div className="alert error" role="alert">{health.error.message}</div>}
+      {devices.isError && <div className="alert error" role="alert">{devices.error.message}</div>}
+      {message && <div className="response-box" role="status">{message}</div>}
+      {error && <div className="alert error" role="alert">{error}</div>}
+    </section>
+    <section className="panel"><h2>Protocol simulator</h2><p>Run a simulator only for software protocol checks. Its traffic is explicitly <strong>SIMULATED</strong> and does not validate the physical board, microphone, speaker, models, or OTA rollback.</p>
+      <div className="form-grid">
+        <label>Simulator device ID<input value={deviceId} onChange={(event) => setDeviceId(event.target.value)} required pattern="[a-zA-Z0-9._-]+" maxLength={128} /></label>
+        <label>Simulator token<input type="password" autoComplete="off" value={simulatorToken} onChange={(event) => setSimulatorToken(event.target.value)} required /></label>
+        <label>Scenario<select value={scenario} onChange={(event) => setScenario(event.target.value)}><option value="observe">Observe control events</option><option value="reconnect">Reconnect</option><option value="replay-gap">Replay-gap recovery</option></select></label>
+      </div>
+      {simulatorCommand && <pre className="response-box">{simulatorCommand}</pre>}
+      <button disabled={!simulatorCommand} onClick={() => void copySimulatorCommand()}><Code2 size={16} />Copy SIMULATED command</button>
+      <p>The token stays in this page's transient input state and is not saved. PCM fixture playback is available from the CLI with <code>--scenario pcm --pcm-file &lt;fixture.pcm&gt;</code>.</p>
+    </section>
+  </>;
+}
+
 function WeatherPage() {
   const [location, setLocation] = useState("");
   const [selected, setSelected] = useState<{ name: string; country?: string; latitude: number; longitude: number; timezone?: string } | null>(null);
@@ -592,6 +896,79 @@ function OTAManagementPage() {
   </>;
 }
 
+type VisionStatus = { enabled: boolean; source: string; camera_active: boolean; remote_frames: boolean; last_frame_age_seconds: number | null; owner_enrolled: boolean; owner_present: boolean; recording: string | null; recordings_saved: number; faces_remembered: number; embeddings: number; telegram_configured: boolean };
+type VisionPerson = { id: string; name: string; role: string; sightings: number; embeddings: number; last_seen_at: string | null };
+type VisionEventRow = { id: string; created_at: string; kind: string; detail: string; media_path: string | null; alerted: boolean };
+type VisionMemoryRow = { id: string; kind: string; label: string; content: string; created_at: string };
+
+function VisionPage() {
+  const [message, setMessage] = useState("");
+  const [error, setError] = useState("");
+  const [snapshot, setSnapshot] = useState("");
+  const status = useQuery({ queryKey: ["vision-status"], queryFn: () => fetchJson<VisionStatus>("/api/v1/vision/status"), refetchInterval: 3_000 });
+  const people = useQuery({ queryKey: ["vision-people"], queryFn: () => fetchJson<VisionPerson[]>("/api/v1/vision/people"), refetchInterval: 5_000 });
+  const events = useQuery({ queryKey: ["vision-events"], queryFn: () => fetchJson<VisionEventRow[]>("/api/v1/vision/events?limit=50"), refetchInterval: 5_000 });
+  const memories = useQuery({ queryKey: ["vision-memories"], queryFn: () => fetchJson<VisionMemoryRow[]>("/api/v1/vision/memories") });
+  const media = useQuery({ queryKey: ["vision-media"], queryFn: () => fetchJson<{ path: string; bytes: number }[]>("/api/v1/vision/media") });
+
+  async function run(action: () => Promise<unknown>, success: string) {
+    setError(""); setMessage("");
+    try { await action(); setMessage(success); await Promise.all([status.refetch(), people.refetch(), events.refetch(), memories.refetch(), media.refetch()]); }
+    catch (caught) { setError((caught as Error).message); }
+  }
+  async function loadBlob(path: string) {
+    const response = await fetch(`${apiBase}${path}`, { headers: { Authorization: `Bearer ${localStorage.getItem(tokenKey) ?? ""}` } });
+    if (!response.ok) throw new Error(`Backend returned HTTP ${response.status}`);
+    return URL.createObjectURL(await response.blob());
+  }
+  async function showSnapshot() { setError(""); try { setSnapshot(await loadBlob("/api/v1/vision/snapshot")); } catch (caught) { setError((caught as Error).message); } }
+  async function openMedia(path: string) {
+    try { window.open(await loadBlob(`/api/v1/vision/media/${path}`), "_blank"); } catch (caught) { setError((caught as Error).message); }
+  }
+  const post = (path: string, body?: unknown) => fetchJson(`/api/v1/vision${path}`, { method: "POST", body: body === undefined ? undefined : JSON.stringify(body) });
+  const current = status.data;
+
+  return <>
+    <PageHeading eyebrow="Security" title="Camera & memory" description="Face recognition, intruder alerts, recordings and remembered objects, text and home layout. Face embeddings are stored, not photos." />
+    {message && <div className="response-box">{message}</div>}{error && <div className="alert error">{error}</div>}{status.isError && <div className="alert error">{status.error.message}</div>}
+    <section className="panel"><div className="panel-heading"><div><h2>Status</h2><p>{current ? `${current.camera_active ? "Camera active" : "Camera inactive"} · source ${current.source}${current.remote_frames ? " (ESP32 frames arriving)" : ""} · owner ${current.owner_enrolled ? (current.owner_present ? "present" : "away") : "not enrolled"} · ${current.faces_remembered} faces / ${current.embeddings} embeddings · Telegram ${current.telegram_configured ? "configured" : "not configured"}${current.recording ? ` · recording (${current.recording})` : ""}` : "Loading"}</p></div></div>
+      <div className="form-grid">
+        <button onClick={() => run(() => post("/monitor", { enabled: !current?.enabled }), current?.enabled ? "Camera security stopped" : "Camera security started")}>{current?.enabled ? "Stop camera security" : "Start camera security"}</button>
+        <button className="secondary" onClick={showSnapshot}>Live snapshot</button>
+        <button className="secondary" onClick={() => run(() => post("/photo"), "Photo taken")}>Take photo</button>
+        <button className="secondary" onClick={() => run(() => post("/recording", { action: current?.recording ? "stop" : "start", seconds: 60 }), current?.recording ? "Recording stopped" : "Recording 60 s")}>{current?.recording ? "Stop recording" : "Record 60 s"}</button>
+        <button className="secondary" onClick={() => run(() => post("/telegram/test"), "Telegram test sent")}>Test Telegram</button>
+      </div>
+      {snapshot && <img src={snapshot} alt="Live camera snapshot" style={{ maxWidth: "100%", marginTop: 12, borderRadius: 8 }} />}
+    </section>
+    <section className="panel"><div className="panel-heading"><div><h2>People</h2><p>Enrol the person currently in front of the camera.</p></div></div>
+      <form className="form-grid" onSubmit={(event: FormEvent<HTMLFormElement>) => { event.preventDefault(); const form = event.currentTarget; const data = new FormData(form); run(() => post("/enroll", { name: String(data.get("name")), role: String(data.get("role")) }), "Face enrolled").then(() => form.reset()); }}>
+        <label>Name<input name="name" required maxLength={80} /></label>
+        <label>Role<select name="role"><option value="owner">Owner</option><option value="known">Known person</option></select></label>
+        <button>Enrol face</button></form>
+      {people.data?.map((person) => <div className="event-row" key={person.id}><div><strong>{person.name}</strong><span>{person.role} · {person.embeddings} embeddings · seen {person.sightings}×{person.last_seen_at ? ` · last ${new Date(person.last_seen_at).toLocaleString()}` : ""}</span></div>
+        <div><button className="secondary" onClick={() => { const name = window.prompt("Name", person.name); if (name) run(() => fetchJson(`/api/v1/vision/people/${person.id}`, { method: "PATCH", body: JSON.stringify({ name }) }), "Renamed"); }}>Rename</button>{person.role === "stranger" && <button className="secondary" onClick={() => run(() => fetchJson(`/api/v1/vision/people/${person.id}`, { method: "PATCH", body: JSON.stringify({ role: "known" }) }), "Marked as known")}>Mark known</button>}<button className="secondary" onClick={() => run(() => fetchJson(`/api/v1/vision/people/${person.id}`, { method: "DELETE" }), "Face forgotten")}>Forget</button></div></div>)}
+    </section>
+    <section className="panel"><div className="panel-heading"><div><h2>Memories</h2><p>Home organisation notes and paper text. Objects are remembered via the camera.</p></div></div>
+      <form className="form-grid" onSubmit={(event: FormEvent<HTMLFormElement>) => { event.preventDefault(); const form = event.currentTarget; const data = new FormData(form); run(() => post("/memories", { kind: String(data.get("kind")), label: String(data.get("label")), content: String(data.get("content")) }), "Memory saved").then(() => form.reset()); }}>
+        <label>Kind<select name="kind"><option value="home">Home / location</option><option value="text">Text note</option></select></label>
+        <label>Label<input name="label" required maxLength={120} /></label>
+        <label>Content<input name="content" required /></label><button>Save memory</button></form>
+      <form className="form-grid" onSubmit={(event: FormEvent<HTMLFormElement>) => { event.preventDefault(); const form = event.currentTarget; const label = String(new FormData(form).get("label")); run(() => post("/memories/object", { label }), `Object "${label}" remembered`).then(() => form.reset()); }}>
+        <label>Object in view<input name="label" required maxLength={120} placeholder="e.g. my phone" /></label><button>Remember object</button></form>
+      <form className="form-grid" onSubmit={(event: FormEvent<HTMLFormElement>) => { event.preventDefault(); const form = event.currentTarget; const label = String(new FormData(form).get("label")); run(() => fetchJson(`/api/v1/vision/memories/read-text?label=${encodeURIComponent(label)}`, { method: "POST" }), "Paper read and remembered").then(() => form.reset()); }}>
+        <label>Paper title<input name="label" maxLength={120} placeholder="e.g. electricity bill" /></label><button>Read paper (OCR)</button></form>
+      {memories.data?.map((item) => <div className="event-row" key={item.id}><div><strong>[{item.kind}] {item.label}</strong><span>{item.content}</span></div><button className="secondary" onClick={() => run(() => fetchJson(`/api/v1/vision/memories/${item.id}`, { method: "DELETE" }), "Memory deleted")}>Delete</button></div>)}
+    </section>
+    <section className="panel"><div className="panel-heading"><div><h2>Security log</h2></div></div>
+      {events.data?.map((item) => <div className="event-row" key={item.id}><div><strong>{item.kind}{item.alerted ? " · alerted" : ""}</strong><span>{new Date(item.created_at).toLocaleString()} · {item.detail}</span></div>{item.media_path && <button className="secondary" onClick={() => openMedia(item.media_path as string)}>Open media</button>}</div>)}
+    </section>
+    <section className="panel"><div className="panel-heading"><div><h2>Recordings & photos</h2></div></div>
+      {media.data?.map((item) => <div className="event-row" key={item.path}><div><strong>{item.path}</strong><span>{(item.bytes / 1024).toFixed(0)} KB</span></div><button className="secondary" onClick={() => openMedia(item.path)}>Open</button></div>)}
+    </section>
+  </>;
+}
+
 function PageHeading({ eyebrow, title, description }: { eyebrow: string; title: string; description: string }) {
   return <section className="page-heading"><div><p className="eyebrow">{eyebrow}</p><h1>{title}</h1><p className="subheading">{description}</p></div></section>;
 }
@@ -601,5 +978,5 @@ export default function App() {
   const navigate = useNavigate();
   if (!authenticated) return <Login onLogin={() => setAuthenticated(true)} />;
   function logout() { localStorage.removeItem(tokenKey); setAuthenticated(false); navigate("/"); }
-  return <Shell onLogout={logout}><Routes><Route path="/" element={<Overview />} /><Route path="/devices" element={<DevicesPage />} /><Route path="/monitoring" element={<MonitoringPage />} /><Route path="/display" element={<DisplayStudioPage />} /><Route path="/ota" element={<OTAManagementPage />} /><Route path="/calendar" element={<CalendarPage />} /><Route path="/games" element={<GamesPage />} /><Route path="/ai" element={<AIPage />} /><Route path="/voice" element={<VoicePage />} /><Route path="/personalization" element={<PersonalizationPage />} /><Route path="/biometric" element={<BiometricPage />} /><Route path="/integrations" element={<IntegrationsPage />} /><Route path="/weather" element={<WeatherPage />} /><Route path="/automation" element={<AutomationPage />} /><Route path="/audit" element={<AuditPage />} /><Route path="*" element={<Navigate to="/" replace />} /></Routes></Shell>;
+  return <Shell onLogout={logout}><Routes><Route path="/" element={<Overview />} /><Route path="/devices" element={<DevicesPage />} /><Route path="/monitoring" element={<MonitoringPage />} /><Route path="/display" element={<DisplayStudioPage />} /><Route path="/ota" element={<OTAManagementPage />} /><Route path="/calendar" element={<CalendarPage />} /><Route path="/alarms" element={<AlarmsPage />} /><Route path="/settings" element={<SettingsPage />} /><Route path="/developer" element={<DeveloperPage />} /><Route path="/games" element={<GamesPage />} /><Route path="/game-history" element={<GameHistoryPage />} /><Route path="/brain" element={<BrainPage />} /><Route path="/ai" element={<AIPage />} /><Route path="/voice" element={<VoicePage />} /><Route path="/personalization" element={<PersonalizationPage />} /><Route path="/biometric" element={<BiometricPage />} /><Route path="/integrations" element={<IntegrationsPage />} /><Route path="/credentials" element={<CredentialsPage />} /><Route path="/notifications" element={<NotificationsPage />} /><Route path="/weather" element={<WeatherPage />} /><Route path="/automation" element={<AutomationPage />} /><Route path="/vision" element={<VisionPage />} /><Route path="/audit" element={<AuditPage />} /><Route path="*" element={<Navigate to="/" replace />} /></Routes></Shell>;
 }

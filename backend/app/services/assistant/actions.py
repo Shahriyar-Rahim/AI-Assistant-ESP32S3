@@ -1,14 +1,15 @@
 from __future__ import annotations
 
+import copy
 import re
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Literal
 from uuid import uuid4
 
 import httpx
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
-from sqlalchemy import select
+from sqlalchemy import select, update
 
 from app.models import (
     AuditLog,
@@ -18,7 +19,7 @@ from app.models import (
     IntegrationAccount,
     Reminder,
 )
-from app.services.games import GAME_NAMES, GameMoveError, new_game
+from app.services.games import GAME_NAMES, GameMoveError, apply_move, new_game
 from app.services.device_display import DISPLAY_PAGES, build_display_payload
 from app.services.integrations.vault import VaultUnavailable, decrypt_credentials
 
@@ -59,7 +60,10 @@ class GameArgs(BaseModel):
 class DisplayPageArgs(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    page: Literal["home", "weather", "reminders", "notes", "todos", "alarms", "games", "notifications"]
+    page: Literal[
+        "home", "weather", "reminders", "notes", "todos", "alarms",
+        "games", "calendar", "notifications",
+    ]
     latitude: float | None = Field(default=None, ge=-90, le=90)
     longitude: float | None = Field(default=None, ge=-180, le=180)
 
@@ -138,13 +142,14 @@ def _list_calendar(context: ActionContext, _: BaseModel) -> dict[str, Any]:
             "kind": item.kind,
         } for item in events]
     _record(context, "calendar.list", {"count": len(result)})
+    display = build_display_payload(context.application.state.db_factory, "calendar")
     if not result:
-        return {"speech": "You have no upcoming calendar events.", "events": []}
+        return {"speech": "You have no upcoming calendar events.", "events": [], "display": display}
     summary = "; ".join(
         f"{item['title']} at {datetime.fromisoformat(item['start_at']).astimezone(timezone.utc).strftime('%A %H:%M UTC')}"
         for item in result[:5]
     )
-    return {"speech": f"Your upcoming events are: {summary}.", "events": result}
+    return {"speech": f"Your upcoming events are: {summary}.", "events": result, "display": display}
 
 
 def _create_reminder(context: ActionContext, args: BaseModel) -> dict[str, Any]:
@@ -241,7 +246,291 @@ def _start_game(context: ActionContext, args: BaseModel) -> dict[str, Any]:
         db.commit()
         session_id = session.id
     _record(context, "game.started", {"session_id": session_id, "game": values.game})
-    return {"speech": f"Starting {values.game.replace('_', ' ')}.", "session_id": session_id, "game": values.game}
+    return {
+        "speech": _game_prompt(values.game, state),
+        "session_id": session_id,
+        "game": values.game,
+        "display": _game_display(values.game, state),
+        "sound_effect": "success",
+    }
+
+
+def _game_prompt(game: str, state: dict[str, Any]) -> str:
+    if state.get("finished") or state.get("won") or state.get("lost") or state.get("winner") or state.get("draw"):
+        if game == "trivia":
+            return f"Trivia is complete. You got {state['score']} correct."
+        if game == "hangman":
+            return "You won." if state.get("won") else f"Game over. The word was {state['word']}."
+        if game == "number_guessing":
+            return f"Correct! The number was {state['secret']}."
+        if game == "word_association":
+            return "Great association!" if state.get("won") else "That round is complete. Let's start another."
+        if game == "tic_tac_toe":
+            return "You won!" if state.get("winner") == "human" else (
+                "It's a draw." if state.get("draw") else "I won this round."
+            )
+    if game == "tic_tac_toe":
+        return "Tic tac toe is ready. Choose a square from one to nine, starting at the top left."
+    if game == "rock_paper_scissors":
+        return "Rock paper scissors is ready. Say rock, paper, or scissors."
+    if game == "number_guessing":
+        return "I'm thinking of a number from one to one hundred. What is your guess?"
+    if game == "trivia":
+        question = state["questions"][state["question_index"]]
+        return f"{question['question']} " + " ".join(question["choices"])
+    if game == "hangman":
+        return "Hangman is ready. Guess a letter."
+    return "Word association is ready. Say a word related to the hidden topic."
+
+
+def _game_display(game: str, state: dict[str, Any]) -> dict[str, Any]:
+    if game == "tic_tac_toe":
+        board = state["board"]
+        items = [" ".join(mark or str(index + 1) for index, mark in enumerate(board[row:row + 3], row))
+                 for row in (0, 3, 6)]
+        detail = f"YOUR TURN {state['turn'] or '-'}"
+    elif game == "rock_paper_scissors":
+        last_round = state.get("last_round")
+        items = [f"ROUND {state['round']}", f"YOU {state['scores']['human']}  AI {state['scores']['ai']}"]
+        if last_round:
+            items.append(f"{last_round['human']} / {last_round['ai']}")
+        detail = "SAY ROCK PAPER SCISSORS"
+    elif game == "number_guessing":
+        items = [f"ATTEMPT {state['guesses']}"]
+        if state.get("last_hint"):
+            items.append("CORRECT" if state["last_hint"] == "correct" else f"GO {state['last_hint'].upper()}")
+        detail = "GUESS 1 TO 100"
+    elif game == "trivia":
+        if state.get("finished"):
+            items = [f"SCORE {state['score']}", "GAME COMPLETE"]
+            detail = "TRIVIA FINISHED"
+        else:
+            question = state["questions"][state["question_index"]]
+            choices = question["choices"]
+            items = [
+                question["question"],
+                " ".join(choices[:2]),
+                " ".join(choices[2:]),
+            ]
+            detail = f"QUESTION {state['question_index'] + 1}"
+    elif game == "hangman":
+        word = state["word"]
+        items = [" ".join(letter if letter in state["guessed"] else "_" for letter in word)]
+        items.append(f"MISTAKES {state['mistakes']}/{state['max_mistakes']}")
+        detail = "GUESS A LETTER"
+    else:
+        items = [f"TURN {state['turns']}/5"]
+        detail = "SAY A RELATED WORD"
+    return {
+        "state": "dashboard",
+        "page": "games",
+        "title": game.replace("_", " ").upper(),
+        "detail": detail,
+        "items": [str(item)[:96] for item in items[:4]],
+        "counts": {},
+        "emoji": "🎮",
+    }
+
+
+def _game_move_speech(
+    game: str,
+    previous: dict[str, Any],
+    state: dict[str, Any],
+    move: dict[str, Any],
+    finished: bool,
+) -> str:
+    if game == "tic_tac_toe":
+        position = move["position"]
+        if finished:
+            return _game_prompt(game, state)
+        ai_position = next(
+            (index for index, mark in enumerate(state["board"])
+             if mark == "O" and previous["board"][index] != "O"),
+            None,
+        )
+        return f"You marked square {position + 1}." + (
+            f" I marked square {ai_position + 1}." if ai_position is not None else ""
+        ) + " Your turn."
+    if game == "rock_paper_scissors":
+        result = state["last_round"]
+        outcome = {
+            "human": "You win this round.",
+            "ai": "I win this round.",
+            "draw": "That round is a draw.",
+        }[result["winner"]]
+        return f"You chose {result['human']}; I chose {result['ai']}. {outcome} Say rock, paper, or scissors."
+    if game == "number_guessing":
+        if state["won"]:
+            return _game_prompt(game, state)
+        return f"Try {state['last_hint']}. What is your next guess?"
+    if game == "trivia":
+        result = "That's correct." if state["last_correct"] else "That's not correct."
+        return f"{result} {_game_prompt(game, state)}"
+    if game == "hangman":
+        if finished:
+            return _game_prompt(game, state)
+        visible = " ".join(
+            character if character in state["guessed"] else "_"
+            for character in state["word"]
+        )
+        found = "is in the word" if move["letter"] in state["word"] else "is not in the word"
+        return (
+            f"{move['letter']} {found}. {visible}. "
+            f"{state['mistakes']} of {state['max_mistakes']} misses. Guess another letter."
+        )
+    if finished:
+        return _game_prompt(game, state)
+    return f"Not that one. Try another related word. Turn {state['turns']} of 5."
+
+
+def _spoken_number(text: str) -> int | None:
+    words = {
+        "zero": 0, "one": 1, "two": 2, "three": 3, "four": 4,
+        "five": 5, "six": 6, "seven": 7, "eight": 8, "nine": 9,
+        "ten": 10, "eleven": 11, "twelve": 12, "thirteen": 13,
+        "fourteen": 14, "fifteen": 15, "sixteen": 16, "seventeen": 17,
+        "eighteen": 18, "nineteen": 19, "twenty": 20, "thirty": 30,
+        "forty": 40, "fifty": 50, "sixty": 60, "seventy": 70,
+        "eighty": 80, "ninety": 90,
+    }
+    tens = {"twenty", "thirty", "forty", "fifty", "sixty", "seventy", "eighty", "ninety"}
+    tokens = re.findall(r"[a-z]+|\d+", text.replace("-", " "))
+    for index, token in enumerate(tokens):
+        if token.isdigit():
+            return int(token)
+        if token == "hundred" and index > 0 and tokens[index - 1] in words:
+            return min(words[tokens[index - 1]] * 100, 100)
+        if token not in words:
+            continue
+        value = words[token]
+        if index + 1 < len(tokens) and tokens[index + 1] == "hundred":
+            return min(value * 100, 100)
+        if token in tens and index + 1 < len(tokens) and tokens[index + 1] in words:
+            value += words[tokens[index + 1]]
+        if value:
+            return value
+    return None
+
+
+def _voice_move(game: str, transcript: str) -> dict[str, Any] | None:
+    text = transcript.strip().casefold()
+    if game == "tic_tac_toe":
+        squares = {
+            "top left": 0, "top middle": 1, "top center": 1, "top right": 2,
+            "middle left": 3, "center": 4, "middle": 4, "middle right": 5,
+            "bottom left": 6, "bottom middle": 7, "bottom center": 7, "bottom right": 8,
+        }
+        for location, position in squares.items():
+            if location in text:
+                return {"position": position}
+        match = re.search(r"\b(?:square|cell|number)?\s*(?:number\s*)?([1-9])\b", text)
+        if match:
+            return {"position": int(match.group(1)) - 1}
+        number_words = {
+            "one": 1, "two": 2, "three": 3, "four": 4, "five": 5,
+            "six": 6, "seven": 7, "eight": 8, "nine": 9,
+        }
+        for word, position in number_words.items():
+            if re.search(rf"\b{word}\b", text):
+                return {"position": position - 1}
+    elif game == "rock_paper_scissors":
+        match = re.search(r"\b(rock|paper|scissors?)\b", text)
+        if match:
+            choice = match.group(1)
+            return {"choice": "scissors" if choice.startswith("scissor") else choice}
+    elif game == "number_guessing":
+        match = re.search(r"\b(?:guess\s+)?(\d{1,3})\b", text)
+        if match:
+            return {"guess": int(match.group(1))}
+        guess = _spoken_number(text)
+        if guess is not None:
+            return {"guess": guess}
+    elif game == "trivia":
+        match = re.search(r"\b(?:option\s+|answer\s+)?([a-d])\b", text)
+        if match:
+            return {"answer": match.group(1).upper()}
+        for index, word in enumerate(("first", "second", "third", "fourth")):
+            if re.search(rf"\b{word}\b", text):
+                return {"answer": "ABCD"[index]}
+    elif game == "hangman":
+        match = re.search(r"\b(?:letter|guess)\s+([a-z])\b", text)
+        if match:
+            return {"letter": match.group(1)}
+        if re.fullmatch(r"[a-z]", text):
+            return {"letter": text}
+    else:
+        word = re.sub(r"^(?:i (?:say|choose|pick)|the word is)\s+", "", text).strip(" .,!?:;")
+        if word:
+            return {"word": word}
+    return None
+
+
+def apply_voice_game_move(context: ActionContext, transcript: str) -> dict[str, Any] | None:
+    with context.application.state.db_factory() as db:
+        session = db.execute(
+            select(GameSession)
+            .where(GameSession.user_id == context.user_id, GameSession.status == "active")
+            .order_by(GameSession.updated_at.desc())
+            .limit(1)
+        ).scalar_one_or_none()
+        if session is None:
+            return None
+        game = session.game
+        if re.search(r"\b(stop|quit|exit|end|cancel)\b.*\b(game|playing)\b|\bstop playing\b", transcript.casefold()):
+            session.status = "abandoned"
+            db.commit()
+            return {"speech": "Okay, I ended the game.", "game": game, "display": None, "sound_effect": None}
+        updated = session.updated_at
+        if updated is not None and updated.tzinfo is None:
+            updated = updated.replace(tzinfo=timezone.utc)
+        if updated is not None and datetime.now(timezone.utc) - updated > timedelta(minutes=10):
+            return None
+        move = _voice_move(game, transcript)
+        if move is None:
+            return {
+                "speech": _game_prompt(game, session.state),
+                "game": game,
+                "display": _game_display(game, session.state),
+                "sound_effect": None,
+            }
+        previous = copy.deepcopy(session.state)
+        state = copy.deepcopy(session.state)
+        try:
+            state = apply_move(game, state, move)
+        except GameMoveError as exc:
+            return {
+                "speech": f"{exc}. {_game_prompt(game, session.state)}",
+                "game": game,
+                "display": _game_display(game, session.state),
+                "sound_effect": "error",
+            }
+        finished = any(state.get(flag) for flag in ("finished", "won", "lost", "winner", "draw"))
+        result = db.execute(
+            update(GameSession)
+            .where(
+                GameSession.id == session.id,
+                GameSession.user_id == context.user_id,
+                GameSession.version == session.version,
+                GameSession.status == "active",
+            )
+            .values(
+                state=state,
+                version=GameSession.version + 1,
+                status="completed" if finished else "active",
+                updated_at=datetime.now(timezone.utc),
+            )
+        )
+        if result.rowcount != 1:
+            raise IntentError("The game changed while I was processing your move. Please try again.")
+        db.commit()
+        session_id = session.id
+    _record(context, "game.voice_move", {"session_id": session_id, "game": game, "move": move})
+    return {
+        "speech": _game_move_speech(game, previous, state, move, finished),
+        "game": game,
+        "display": _game_display(game, state),
+        "sound_effect": "success" if finished else "move",
+    }
 
 
 async def _show_display_page(context: ActionContext, args: BaseModel) -> dict[str, Any]:
@@ -333,6 +622,12 @@ def build_registry() -> ActionRegistry:
 ACTION_REGISTRY = build_registry()
 GAME_ALIASES = {
     "tic tac toe": "tic_tac_toe",
+    "tik tak toe": "tic_tac_toe",
+    "tick tack toe": "tic_tac_toe",
+    "tic-tac-toe": "tic_tac_toe",
+    "tictactoe": "tic_tac_toe",
+    "tic tac toes": "tic_tac_toe",
+    "noughts and crosses": "tic_tac_toe",
     "rock paper scissors": "rock_paper_scissors",
     "number guessing": "number_guessing",
     "trivia": "trivia",
@@ -344,7 +639,8 @@ ISO_DATETIME = r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2})?(?:Z|[+-]\d{2}:\d{2})"
 
 def deterministic_intent(text: str) -> tuple[str, dict[str, Any]] | None:
     normalized = text.strip()
-    lower = normalized.casefold()
+    lower = re.sub(r"[^\w\s-]", " ", normalized.casefold())
+    lower = re.sub(r"\s+", " ", lower)
     if re.search(r"\b(calendar|agenda|schedule)\b", lower) and re.search(r"\b(what|show|list|upcoming|next)\b", lower):
         return "calendar.list", {}
     reminder = re.search(
@@ -385,6 +681,7 @@ def deterministic_intent(text: str) -> tuple[str, dict[str, Any]] | None:
         (r"\b(?:show|open|view|display)\b.*\b(?:to[\s-]?dos?|tasks?)\b", "todos"),
         (r"\b(?:show|open|view|display)\b.*\balarms?\b", "alarms"),
         (r"\b(?:show|open|view|display)\b.*\bgames?\b", "games"),
+        (r"\b(?:show|open|view|display)\b.*\bcalendar\b", "calendar"),
         (r"\b(?:show|open|view|display)\b.*\bnotifications?\b", "notifications"),
     )
     for pattern, page in page_patterns:
@@ -399,7 +696,7 @@ def deterministic_intent(text: str) -> tuple[str, dict[str, Any]] | None:
                     arguments.update(latitude=float(coords.group(1)), longitude=float(coords.group(2)))
             return "display.show_page", arguments
     for spoken_name, game in GAME_ALIASES.items():
-        if re.search(rf"\b(?:play|start)\s+(?:a\s+game\s+of\s+)?{re.escape(spoken_name)}\b", lower):
+        if re.search(rf"\b(?:play|start|begin|open)\s+(?:a\s+|the\s+|some\s+)?(?:game\s+of\s+)?{re.escape(spoken_name)}\b", lower):
             return "game.start", {"game": game}
     if re.search(r"\bgithub\b", lower) and re.search(r"\b(notification|notifications|inbox)\b", lower):
         return "integration.github_notifications", {}

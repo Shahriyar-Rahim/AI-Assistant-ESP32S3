@@ -129,6 +129,52 @@ def save_github_credentials(
     return {"provider": "github", "credential": "encrypted"}
 
 
+@router.get("/integrations/accounts")
+def integration_accounts(request: Request, _: User = Depends(require_user)) -> dict[str, object]:
+    with request.app.state.db_factory() as db:
+        accounts = {
+            row.provider: row
+            for row in db.query(IntegrationAccount).all()
+        }
+        providers = []
+        for provider in ("github", "gmail", "linkedin"):
+            account = accounts.get(provider)
+            environment_configured = provider == "github" and bool(request.app.state.settings.github_token)
+            source = "environment" if environment_configured else "encrypted_storage" if account else None
+            providers.append({
+                "provider": provider,
+                "configured": environment_configured or account is not None,
+                "credential_source": source,
+                "scopes": account.scopes if account and not environment_configured else [],
+                "connected_at": account.created_at.isoformat() if account and not environment_configured else None,
+            })
+        return {"accounts": providers}
+
+
+@router.delete("/integrations/{provider}/credentials")
+def delete_integration_credentials(
+    provider: str,
+    request: Request,
+    user: User = Depends(require_admin),
+) -> dict[str, object]:
+    if provider not in {"github", "gmail", "linkedin"}:
+        raise HTTPException(404, "integration provider not found")
+    if provider == "github" and request.app.state.settings.github_token:
+        raise HTTPException(409, "GitHub is configured by a backend environment secret; remove it there instead.")
+    with request.app.state.db_factory() as db:
+        account = db.query(IntegrationAccount).filter(IntegrationAccount.provider == provider).one_or_none()
+        if account is None:
+            raise HTTPException(404, "stored integration credentials not found")
+        db.delete(account)
+        db.commit()
+    _audit(request, provider, "Stored integration credentials removed", "success", {"user_id": user.id})
+    return {
+        "provider": provider,
+        "removed": True,
+        "provider_revocation_required": True,
+    }
+
+
 @router.get("/integrations/github/repositories")
 async def github_repositories(request: Request, _: User = Depends(require_user)) -> dict[str, object]:
     data = await _github_request(request, "/user/repos?per_page=50&sort=updated")

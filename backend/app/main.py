@@ -23,11 +23,15 @@ from app.api.devices import router as devices_router
 from app.api.games import router as games_router
 from app.api.health import router as health_router
 from app.api.integrations import router as integrations_router
+from app.api.news import router as news_router
+from app.api.brain import router as brain_router
 from app.api.weather import router as weather_router
 from app.api.monitoring import router as monitoring_router
 from app.api.display import router as display_router
 from app.api.ota import router as ota_router
 from app.api.alert_rules import router as alert_rules_router
+from app.api.vision import router as vision_router
+from app.services.vision.monitor import VisionMonitor
 from app.core.config import Settings
 from app.core.security import hash_password
 from app.database.session import Base, create_database
@@ -40,6 +44,15 @@ from app.services.assistant.personalization import voice_retention_loop
 
 logger = logging.getLogger(__name__)
 
+# Uvicorn only configures its own loggers; without a handler the application's INFO diagnostics
+# (wake scores, audio stream, TTS) are silently dropped.
+_app_logger = logging.getLogger("app")
+if not _app_logger.handlers:
+    _handler = logging.StreamHandler()
+    _handler.setFormatter(logging.Formatter("%(levelname)s:     %(name)s: %(message)s"))
+    _app_logger.addHandler(_handler)
+    _app_logger.setLevel(logging.INFO)
+
 
 class ApiRateLimitMiddleware(BaseHTTPMiddleware):
     def __init__(self, app, requests_per_minute: int = 120, redis_client=None):
@@ -49,7 +62,7 @@ class ApiRateLimitMiddleware(BaseHTTPMiddleware):
         self.hits: dict[tuple[str, int], int] = defaultdict(int)
 
     async def dispatch(self, request, call_next):
-        if request.url.path.startswith("/api/v1/") and request.url.path != "/api/v1/health":
+        if request.url.path.startswith("/api/v1/") and request.url.path != "/api/v1/health" and not request.url.path.startswith("/api/v1/vision/frames/"):
             client = request.client.host if request.client else "unknown"
             window = math.floor(time.time() / 60)
             count = await self._count(client, window)
@@ -121,6 +134,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     ))
                     db.commit()
         application.state.telemetry_broadcast_queue = asyncio.Queue(maxsize=256)
+        try:
+            await application.state.vision.start()
+        except Exception:
+            logging.getLogger(__name__).exception("Camera security could not start")
         worker = asyncio.create_task(scheduler_loop(application))
         automation_worker = asyncio.create_task(automation_rule_loop(application))
         telemetry_worker = asyncio.create_task(telemetry_broadcast_loop(application))
@@ -128,6 +145,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         try:
             yield
         finally:
+            await application.state.vision.stop()
             worker.cancel()
             automation_worker.cancel()
             telemetry_worker.cancel()
@@ -146,6 +164,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     application.state.db_factory = db_factory
     application.state.devices = {}
     application.state.device_sockets = {}
+    application.state.device_boot_greetings = {}
     application.state.pending_controls = []
     application.state.biometric_failures = {}
     application.state.telemetry_clients = set()
@@ -153,6 +172,15 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     application.state.pending_pings = {}
     application.state.audio_echo_until = {}
     application.state.wake_briefings = {}
+    application.state.game_waiters = {}
+    application.state.device_capabilities = {}
+    application.state.schedule_hashes = {}
+    application.state.pending_setup = {}
+    application.state.device_games = {}
+    application.state.relisten = {}
+    application.state.home_tasks = {}
+    application.state.pending_suggestions = {}
+    application.state.vision = VisionMonitor(application)
     application.state.ota_progress = {}
     application.state.ota_pending = {}
     application.state.ota_pending_lock = asyncio.Lock()
@@ -192,6 +220,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     application.include_router(personalization_router, prefix="/api/v1")
     application.include_router(integrations_router, prefix="/api/v1")
     application.include_router(weather_router, prefix="/api/v1")
+    application.include_router(news_router, prefix="/api/v1")
+    application.include_router(brain_router, prefix="/api/v1")
     application.include_router(automation_router, prefix="/api/v1")
     application.include_router(games_router, prefix="/api/v1/games")
     application.include_router(audit_router, prefix="/api/v1")
@@ -200,6 +230,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     application.include_router(display_router, prefix="/api/v1")
     application.include_router(ota_router, prefix="/api/v1")
     application.include_router(alert_rules_router, prefix="/api/v1")
+    application.include_router(vision_router, prefix="/api/v1")
     application.include_router(device_ws_router, prefix="/api/v1/ws")
     return application
 

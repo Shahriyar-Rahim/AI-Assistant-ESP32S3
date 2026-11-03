@@ -11,6 +11,7 @@ from sqlalchemy.exc import IntegrityError
 from zoneinfo import ZoneInfo
 
 from app.models import AuditLog, CalendarEvent, Notification, Reminder
+from app.services.schedule_sync import push_changed_schedules
 from app.services.automation.health_checks import check_endpoint, due_endpoint_ids
 
 logger = logging.getLogger(__name__)
@@ -124,6 +125,7 @@ async def scheduler_loop(application) -> None:
     while True:
         try:
             pending = await asyncio.to_thread(process_due_notifications, application)
+            await push_changed_schedules(application)
             for notification in pending:
                 await broadcast_notification(application, notification)
             endpoint_ids = await asyncio.to_thread(due_endpoint_ids, application)
@@ -145,6 +147,9 @@ async def broadcast_notification(application, notification: dict[str, object]) -
         return
     delivered = False
     for device_id, websocket in sockets:
+        if "local_schedule" in application.state.device_capabilities.get(device_id, ()):
+            delivered = True  # the device fires this item from its own stored schedule
+            continue
         try:
             await websocket.send_json({
                 "protocol_version": 1,

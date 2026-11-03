@@ -5,6 +5,8 @@ from dataclasses import dataclass
 
 from dotenv import load_dotenv
 
+from app.services.tts.gemini import normalize_voice
+
 
 @dataclass(frozen=True)
 class Settings:
@@ -40,17 +42,38 @@ class Settings:
     linkedin_redirect_uri: str = ""
     stt_provider: str = "openai"
     stt_language: str = "en"
+    tts_provider: str = "openai"
+    tts_model: str = "gpt-4o-mini-tts"
+    tts_voice: str = "alloy"
     anti_spoof_model_path: str = ""
     anti_spoof_threshold: float = 0.8
+    biometric_mode: str = "enforce"
     redis_url: str = ""
     rate_limit_per_minute: int = 120
     allowed_hosts: tuple[str, ...] = ("*",)
     firmware_storage_dir: str = "./firmware-releases"
     personalization_audio_retention_days: int = 30
+    boot_briefing: bool = True
+    wake_weather: bool = True
+    local_brain_first: bool = True
+    ai_fallback_model: str = "gemini-3.1-flash-lite"
+    news_default_country: str = "US"
+    telegram_bot_token: str = ""
+    telegram_chat_id: str = ""
+    camera_enabled: bool = False
+    camera_source: str = "local"  # local (USB camera on this PC) | device (frames pushed by the ESP32) | auto
+    camera_index: int = 0
+    camera_interval_seconds: float = 0.7
+    camera_owner_grace_seconds: float = 45.0
+    camera_away_record_after_seconds: float = 60.0
+    camera_segment_seconds: int = 300
+    camera_low_memory: bool = True
+    vision_dir: str = "data/vision"
 
     @classmethod
     def from_env(cls) -> "Settings":
-        load_dotenv()
+        # .env wins over stale shell/IDE-exported values; tests set the environment explicitly.
+        load_dotenv(override="PYTEST_CURRENT_TEST" not in os.environ)
         max_frame = int(os.getenv("MAX_AUDIO_FRAME_BYTES", "4096"))
         threshold = int(os.getenv("VAD_RMS_THRESHOLD", "450"))
         end_silence = int(os.getenv("VAD_END_SILENCE_MS", "900"))
@@ -60,7 +83,13 @@ class Settings:
         retention_days = int(os.getenv("AUDIT_RETENTION_DAYS", "365"))
         stt_provider = os.getenv("STT_PROVIDER", "openai").strip().lower()
         stt_language = os.getenv("STT_LANGUAGE", "en").strip().lower()
+        tts_provider = os.getenv("TTS_PROVIDER", "openai").strip().lower()
+        tts_model = os.getenv("TTS_MODEL", "gpt-4o-mini-tts").strip()
+        tts_voice = os.getenv("TTS_VOICE", "alloy").strip()
         anti_spoof_threshold = float(os.getenv("ANTI_SPOOF_THRESHOLD", "0.8"))
+        biometric_mode = os.getenv("BIOMETRIC_MODE", "enforce").strip().lower()
+        if biometric_mode not in {"enforce", "enrolled_only"}:
+            raise ValueError("BIOMETRIC_MODE must be 'enforce' or 'enrolled_only'")
         rate_limit = int(os.getenv("RATE_LIMIT_PER_MINUTE", "120"))
         personalization_retention = int(os.getenv("PERSONALIZATION_AUDIO_RETENTION_DAYS", "30"))
         if max_frame < 27 or max_frame > 1_048_576:
@@ -81,6 +110,21 @@ class Settings:
             raise ValueError("STT_PROVIDER must be 'openai' or 'local'")
         if stt_language not in {"en", "bn"}:
             raise ValueError("STT_LANGUAGE must be 'en' or 'bn'")
+        if tts_provider == "piper":
+            tts_provider = "local"
+        if tts_provider not in {"openai", "gemini", "local"}:
+            raise ValueError("TTS_PROVIDER must be 'openai', 'gemini', 'piper' or 'local'")
+        if not tts_model:
+            raise ValueError("TTS_MODEL cannot be empty")
+        if tts_provider == "gemini":
+            if normalize_voice(tts_voice) is None:
+                raise ValueError("TTS_VOICE must be a supported Gemini voice")
+        elif tts_provider != "local" and tts_voice.lower() not in {
+            "alloy", "ash", "ballad", "coral", "echo", "fable", "onyx", "nova", "sage", "shimmer", "verse",
+        }:
+            raise ValueError("TTS_VOICE must be a supported OpenAI voice")
+        if tts_provider == "openai":
+            tts_voice = tts_voice.lower()
         if not 0.5 <= anti_spoof_threshold <= 0.999:
             raise ValueError("ANTI_SPOOF_THRESHOLD must be between 0.5 and 0.999")
         if not 1 <= rate_limit <= 100_000:
@@ -92,7 +136,24 @@ class Settings:
             for item in os.getenv("ALLOWED_ORIGINS", "http://localhost:5173").split(",")
             if item.strip()
         )
+        flag = lambda name: os.getenv(name, "true").strip().casefold() not in {"0", "false", "no", "off"}
         return cls(
+            boot_briefing=flag("BOOT_BRIEFING"),
+            wake_weather=flag("WAKE_WEATHER"),
+            local_brain_first=flag("LOCAL_BRAIN_FIRST"),
+            ai_fallback_model=os.getenv("AI_FALLBACK_MODEL", "gemini-3.1-flash-lite").strip(),
+            telegram_bot_token=os.getenv("TELEGRAM_BOT_TOKEN", "").strip(),
+            telegram_chat_id=os.getenv("TELEGRAM_CHAT_ID", "").strip(),
+            camera_enabled=os.getenv("CAMERA_ENABLED", "false").strip().casefold() in {"1", "true", "yes", "on"},
+            camera_source=os.getenv("CAMERA_SOURCE", "local").strip().lower(),
+            camera_index=int(os.getenv("CAMERA_INDEX", "0")),
+            camera_interval_seconds=float(os.getenv("CAMERA_INTERVAL_SECONDS", "0.7")),
+            camera_owner_grace_seconds=float(os.getenv("CAMERA_OWNER_GRACE_SECONDS", "45")),
+            camera_away_record_after_seconds=float(os.getenv("CAMERA_AWAY_RECORD_AFTER_SECONDS", "60")),
+            camera_segment_seconds=int(os.getenv("CAMERA_SEGMENT_SECONDS", "300")),
+            camera_low_memory=os.getenv("CAMERA_LOW_MEMORY", "true").strip().casefold() in {"1", "true", "yes", "on"},
+            vision_dir=os.getenv("VISION_DIR", "data/vision").strip(),
+            news_default_country=os.getenv("NEWS_DEFAULT_COUNTRY", "US").strip().upper()[:2] or "US",
             database_url=os.getenv("DATABASE_URL", "sqlite:///./assistant.db"),
             device_token=os.getenv("DEVICE_TOKEN", ""),
             simulator_token=os.getenv("SIMULATOR_TOKEN", ""),
@@ -125,8 +186,12 @@ class Settings:
             linkedin_redirect_uri=os.getenv("LINKEDIN_REDIRECT_URI", ""),
             stt_provider=stt_provider,
             stt_language=stt_language,
+            tts_provider=tts_provider,
+            tts_model=tts_model,
+            tts_voice=tts_voice,
             anti_spoof_model_path=os.getenv("ANTI_SPOOF_MODEL_PATH", ""),
             anti_spoof_threshold=anti_spoof_threshold,
+            biometric_mode=biometric_mode,
             redis_url=os.getenv("REDIS_URL", ""),
             rate_limit_per_minute=rate_limit,
             allowed_hosts=tuple(

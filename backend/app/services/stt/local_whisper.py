@@ -64,7 +64,11 @@ def transcribe_pcm_sync(
             vad_filter=False,
             condition_on_previous_text=False,
         )
-        transcript = " ".join(segment.text.strip() for segment in segments).strip()
+        transcript = " ".join(
+            segment.text.strip()
+            for segment in segments
+            if segment.no_speech_prob < 0.6 and segment.avg_logprob > -1.2
+        ).strip()
     except LocalSpeechUnavailable:
         raise
     except (OSError, RuntimeError, ValueError) as exc:

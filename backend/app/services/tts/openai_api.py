@@ -11,27 +11,38 @@ class TTSServiceError(RuntimeError):
     pass
 
 
-def resample_24k_to_16k(pcm: bytes) -> bytes:
+def resample_pcm(pcm: bytes, source_rate: int, target_rate: int) -> bytes:
     if len(pcm) % 2:
         raise ValueError("PCM16 audio must contain whole samples")
+    if source_rate <= 0 or target_rate <= 0:
+        raise ValueError("PCM sample rates must be positive")
+    if source_rate == target_rate:
+        return pcm
     samples = array("h")
     samples.frombytes(pcm)
     if struct.pack("=H", 1) != struct.pack("<H", 1):
         samples.byteswap()
     if not samples:
         return b""
-    output_count = (len(samples) * 2 + 2) // 3
+    output_count = (len(samples) * target_rate + source_rate - 1) // source_rate
     converted = array("h")
     for output_index in range(output_count):
-        source_position_num = output_index * 3
-        left_index = source_position_num // 2
-        fraction_num = source_position_num % 2
+        source_position_num = output_index * source_rate
+        left_index = source_position_num // target_rate
+        fraction_num = source_position_num % target_rate
         right_index = min(left_index + 1, len(samples) - 1)
-        value = (samples[left_index] * (2 - fraction_num) + samples[right_index] * fraction_num) // 2
+        value = (
+            samples[left_index] * (target_rate - fraction_num)
+            + samples[right_index] * fraction_num
+        ) // target_rate
         converted.append(max(-32768, min(32767, value)))
     if struct.pack("=H", 1) != struct.pack("<H", 1):
         converted.byteswap()
     return converted.tobytes()
+
+
+def resample_24k_to_16k(pcm: bytes) -> bytes:
+    return resample_pcm(pcm, 24_000, 16_000)
 
 
 async def synthesize_pcm(text: str, model: str, voice: str) -> bytes:

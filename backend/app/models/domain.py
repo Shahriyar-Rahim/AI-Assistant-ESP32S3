@@ -105,6 +105,27 @@ class GameSession(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, onupdate=utc_now, nullable=False)
 
 
+class GameResult(Base):
+    """One finished (or abandoned) game, used for history, statistics and adaptive play."""
+
+    __tablename__ = "game_results"
+    __table_args__ = (Index("ix_game_results_user_game", "user_id", "game", "finished_at"),)
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid4()))
+    user_id: Mapped[str | None] = mapped_column(ForeignKey("users.id"))
+    device_id: Mapped[str | None] = mapped_column(String(128))
+    game: Mapped[str] = mapped_column(String(32), nullable=False)
+    outcome: Mapped[str] = mapped_column(String(16), nullable=False)
+    score: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    max_score: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    rounds: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    duration_seconds: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    difficulty: Mapped[str] = mapped_column(String(16), nullable=False, default="normal")
+    source: Mapped[str] = mapped_column(String(16), nullable=False, default="device")
+    simulated: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    finished_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
+
+
 class IntegrationAccount(Base):
     __tablename__ = "integration_accounts"
 
@@ -272,3 +293,21 @@ class OTARelease(Base):
     hardware_target: Mapped[str] = mapped_column(String(64), nullable=False, default="esp32-s3-n16r8")
     created_by: Mapped[str | None] = mapped_column(ForeignKey("users.id"))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
+
+
+class LearnedResponse(Base):
+    """What the local brain has learned: cloud answers, remembered intents and facts told by the user."""
+
+    __tablename__ = "learned_responses"
+    __table_args__ = (Index("ix_learned_responses_user_kind", "user_id", "kind"),)
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid4()))
+    user_id: Mapped[str | None] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"))
+    kind: Mapped[str] = mapped_column(String(16), nullable=False)  # reply | action | fact
+    prompt: Mapped[str] = mapped_column(String(300), nullable=False)
+    tokens: Mapped[list] = mapped_column(JSON, nullable=False, default=list)
+    response: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
+    source: Mapped[str] = mapped_column(String(16), nullable=False, default="cloud")
+    uses: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
+    last_used_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)

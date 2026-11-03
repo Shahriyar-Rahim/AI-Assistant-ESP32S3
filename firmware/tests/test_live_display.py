@@ -12,12 +12,23 @@ def test_st7735_has_live_pages_face_animation_and_server_payload_consumer() -> N
     assert "esp_err_t set_speaking_for(uint32_t duration_ms);" in header
     assert 'xTaskCreate(display_task, task_name' in display
     assert "display_model.animation_frame % 3 == 0" in display
+    assert "flush_tft_region(size_t x, size_t y, size_t width, size_t height)" in display
+    assert "flush_tft_region(80, 8, 48, 48)" in display
+    assert "active_panel == Panel::Tft && !full_refresh" in display
     assert "display_model.blink = true;" in display
     assert 'std::strcmp(display_model.page.data(), "home") == 0' in display
     assert "draw_text(display_model.title.data()" in display
     assert "draw_text(display_model.items[index].data()" in display
     assert 'std::strcmp(type->valuestring, "display.state") == 0' in network
     assert "DeviceDisplay::set_dashboard(" in network
+    assert 'std::strcmp(type->valuestring, "game.state") == 0' in network
+    assert 'std::strcmp(type->valuestring, "calendar.notification") == 0' in network
+    assert 'std::strcmp(type->valuestring, "sound.effect") == 0' in network
+    assert 'std::strcmp(type->valuestring, "animation.state") == 0' in network
+    assert 'std::strcmp(emoji, "🎮") == 0' in display
+    assert "esp_err_t queue_sound_effect(const char* effect)" in (
+        ROOT / "main" / "audio_i2s.cpp"
+    ).read_text()
     assert 'std::strcmp(type->valuestring, "tts.start") == 0' in network
     assert "DeviceDisplay::set_speaking_for(" in network
     assert 'HardwareConfig::TFT::MOSI' in display

@@ -2,12 +2,13 @@ from __future__ import annotations
 
 from uuid import uuid4
 
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel, Field
 from sqlalchemy import update
 
 from app.api.dependencies import require_user
 from app.models import AuditLog, GameSession, User
+from app.services import game_history
 from app.services.games import GAME_NAMES, GameMoveError, apply_move, new_game
 
 router = APIRouter(dependencies=[Depends(require_user)])
@@ -48,6 +49,24 @@ def _audit(request: Request, user_id: str, action: str, metadata: dict) -> None:
             metadata_json={"user_id": user_id, **metadata},
         ))
         db.commit()
+
+
+@router.get("/history")
+def game_history_list(request: Request, limit: int = Query(50, ge=1, le=500), user: User = Depends(require_user)) -> dict[str, object]:
+    return {"results": game_history.history(request.app.state.db_factory, user.id, limit)}
+
+
+@router.get("/stats")
+def game_statistics(request: Request, user: User = Depends(require_user)) -> dict[str, object]:
+    stats = game_history.user_stats(request.app.state.db_factory, user.id)
+    stats["summary"] = game_history.spoken_summary(request.app.state.db_factory, user.id)
+    return stats
+
+
+@router.delete("/history", status_code=204)
+def game_history_clear(request: Request, user: User = Depends(require_user)) -> None:
+    deleted = game_history.clear_history(request.app.state.db_factory, user.id)
+    _audit(request, user.id, "game history cleared", {"deleted": deleted})
 
 
 @router.post("/{game}/sessions", status_code=201)

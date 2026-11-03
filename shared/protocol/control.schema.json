@@ -16,7 +16,7 @@
         "biometric.result", "assistant.response", "tts.start", "tts.end",
         "display.state", "animation.state", "sound.effect", "device.brightness",
         "device.microphone", "ota.status", "calendar.notification",
-        "game.state", "weather.alert", "device.error", "ping", "pong"
+        "game.state", "game.command", "game.event", "device.setup", "schedule.sync", "schedule.fired", "game.history", "weather.alert", "device.error", "ping", "pong"
       ]
     },
     "payload": { "type": "object" }
