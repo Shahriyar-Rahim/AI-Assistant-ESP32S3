@@ -1,0 +1,31 @@
+{
+	"folders": [
+		{
+			"path": "../.."
+		},
+		{
+			"name": "firmware",
+			"path": ".."
+		}
+	],
+	"settings": {
+		"chat.tools.terminal.autoApprove": {
+			"/^pwd && printf '\\\\nTop-level entries:\\\\n' && ls -la && printf '\\\\nGit status:\\\\n' && git status --short 2>&1 \\|\\| true$/": {
+				"approve": true,
+				"matchCommandLine": true
+			},
+			"/^node --version 2>&1 \\|\\| true; npm --version 2>&1 \\|\\| true; docker --version 2>&1 \\|\\| true$/": {
+				"approve": true,
+				"matchCommandLine": true
+			},
+			"/^python --version && python -m pip --version && command -v pio \\|\\| true && command -v platformio \\|\\| true$/": {
+				"approve": true,
+				"matchCommandLine": true
+			},
+			"/^python -m pip install -r backend/requirements\\.txt$/": {
+				"approve": true,
+				"matchCommandLine": true
+			}
+		}
+	}
+}
