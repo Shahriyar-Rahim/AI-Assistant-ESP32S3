@@ -6,20 +6,20 @@
 #include <cctype>
 #include <cstdio>
 #include <cstring>
-#include <string>
 #include <ctime>
+#include <string>
 
 #include "audio_i2s.h"
 #include "cJSON.h"
 #include "device_display.h"
 #include "device_games.h"
 #include "device_schedule.h"
+#include "esp_app_desc.h"
 #include "esp_check.h"
 #include "esp_crt_bundle.h"
 #include "esp_event.h"
 #include "esp_http_client.h"
 #include "esp_http_server.h"
-#include "esp_app_desc.h"
 #include "esp_log.h"
 #include "esp_mac.h"
 #include "esp_netif.h"
@@ -34,19 +34,22 @@
 #include "freertos/queue.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
-#include "nvs.h"
-#include "nvs_flash.h"
 #include "hardware_config.h"
-#include "psa/crypto.h"
 #include "lwip/inet.h"
 #include "lwip/sockets.h"
+#include "nvs.h"
+#include "nvs_flash.h"
+#include "psa/crypto.h"
 
 namespace
 {
 
     constexpr char TAG[] = "device_network";
     constexpr char NVS_NAMESPACE[] = "assistant";
-    constexpr char CONNECTED_BIT = BIT0;
+    constexpr EventBits_t CONNECTED_BIT = BIT0;
+    constexpr EventBits_t START_AP_BIT = BIT1;
+    constexpr EventBits_t WEBSOCKET_READY_BIT = BIT2;
+
     constexpr size_t AUDIO_HEADER_SIZE = 25;
     constexpr size_t MAX_AUDIO_FRAME_SAMPLES = HardwareConfig::Audio::CAPTURE_SAMPLES * 4;
     constexpr size_t MAX_PACKET_SIZE = AUDIO_HEADER_SIZE + MAX_AUDIO_FRAME_SAMPLES * sizeof(int16_t);
@@ -57,6 +60,22 @@ namespace
     constexpr size_t OTA_MAX_IMAGE_SIZE = 6 * 1024 * 1024;
     constexpr TickType_t AUDIO_SEND_TIMEOUT = pdMS_TO_TICKS(3000);
     constexpr char SETUP_AP_PASSWORD[] = "BuddySetup-ESP32S3";
+
+    constexpr int MAX_WIFI_RETRIES = 5;
+    int wifi_retry_count = 0;
+
+    // DNS Header structure per RFC 1035 for captive portal redirection
+    struct __attribute__((packed)) DnsHeader
+    {
+        uint16_t id;
+        uint16_t flags;
+        uint16_t qd_count;
+        uint16_t an_count;
+        uint16_t ns_count;
+        uint16_t ar_count;
+    };
+
+    TaskHandle_t dns_task_handle = nullptr;
 
     struct ReplayFrame
     {
@@ -88,30 +107,135 @@ namespace
     };
 
     DeviceConfig config;
+    SemaphoreHandle_t config_mutex = nullptr;
     bool saved_config_loaded = false;
     bool portal_session = false;
     constexpr uint32_t PORTAL_SESSION_TIMEOUT_MS = 10 * 60 * 1000;
     bool station_configured = false;
     bool setup_ap_active = false;
     char setup_ssid[32]{};
-    EventGroupHandle_t wifi_events;
-    EventGroupHandle_t websocket_events;
-    esp_websocket_client_handle_t websocket;
+    EventGroupHandle_t wifi_events = nullptr;
+    EventGroupHandle_t websocket_events = nullptr;
+    esp_websocket_client_handle_t websocket = nullptr;
     alignas(int16_t) char control_buffer[CONTROL_BUFFER_SIZE];
-    size_t control_buffer_used;
-    constexpr EventBits_t WEBSOCKET_READY_BIT = BIT2;
+    size_t control_buffer_used = 0;
     std::atomic_bool microphone_stream_enabled{true};
     std::atomic<uint32_t> next_audio_sequence{0};
     std::array<ReplayFrame, REPLAY_WINDOW_SIZE> replay_window{};
-    QueueHandle_t replay_requests;
-    QueueHandle_t ota_requests;
-    SemaphoreHandle_t websocket_send_mutex;
+    QueueHandle_t replay_requests = nullptr;
+    QueueHandle_t ota_requests = nullptr;
+    SemaphoreHandle_t websocket_send_mutex = nullptr;
     portMUX_TYPE replay_lock = portMUX_INITIALIZER_UNLOCKED;
     int brightness_percent = 50;
     bool backlight_initialized = false;
     uint64_t boot_identifier = 0;
 
     bool copy_json_string(const cJSON *object, const char *key, char *target, size_t capacity, bool required);
+    bool request_is_from_setup_ap(httpd_req_t *request);
+    esp_err_t persist_config(const DeviceConfig &value);
+
+    // Dynamic DNS server resolving all domain queries to 192.168.4.1
+    void dns_server_task(void *)
+    {
+        int socket_fd = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+        if (socket_fd < 0)
+        {
+            ESP_LOGE(TAG, "Failed to create DNS socket");
+            vTaskDelete(nullptr);
+            return;
+        }
+
+        int enable = 1;
+        setsockopt(socket_fd, SOL_SOCKET, SO_REUSEADDR, &enable, sizeof(enable));
+
+        sockaddr_in server_addr{};
+        server_addr.sin_family = AF_INET;
+        server_addr.sin_addr.s_addr = htonl(INADDR_ANY);
+        server_addr.sin_port = htons(53);
+
+        if (bind(socket_fd, reinterpret_cast<sockaddr *>(&server_addr), sizeof(server_addr)) < 0)
+        {
+            ESP_LOGE(TAG, "Failed to bind DNS socket on port 53");
+            close(socket_fd);
+            vTaskDelete(nullptr);
+            return;
+        }
+
+        ESP_LOGI(TAG, "Captive Portal DNS Server running on UDP port 53");
+
+        std::array<uint8_t, 512> rx_buffer{};
+        sockaddr_in client_addr{};
+        socklen_t client_addr_len = sizeof(client_addr);
+
+        while (setup_ap_active)
+        {
+            int len = recvfrom(socket_fd, rx_buffer.data(), rx_buffer.size(), 0,
+                               reinterpret_cast<sockaddr *>(&client_addr), &client_addr_len);
+
+            if (len < static_cast<int>(sizeof(DnsHeader)))
+                continue;
+
+            auto *dns_hdr = reinterpret_cast<DnsHeader *>(rx_buffer.data());
+
+            // Standard DNS response, 1 Answer
+            dns_hdr->flags = htons(0x8180);
+            dns_hdr->an_count = htons(1);
+
+            int reply_len = len;
+
+            // Name pointer to question section (0xC00C)
+            rx_buffer[reply_len++] = 0xC0;
+            rx_buffer[reply_len++] = 0x0C;
+
+            // Type A (0x0001)
+            rx_buffer[reply_len++] = 0x00;
+            rx_buffer[reply_len++] = 0x01;
+
+            // Class IN (0x0001)
+            rx_buffer[reply_len++] = 0x00;
+            rx_buffer[reply_len++] = 0x01;
+
+            // TTL: 60 seconds
+            rx_buffer[reply_len++] = 0x00;
+            rx_buffer[reply_len++] = 0x00;
+            rx_buffer[reply_len++] = 0x00;
+            rx_buffer[reply_len++] = 0x3C;
+
+            // Data length: 4 bytes (IPv4)
+            rx_buffer[reply_len++] = 0x00;
+            rx_buffer[reply_len++] = 0x04;
+
+            // Target AP IP: 192.168.4.1
+            rx_buffer[reply_len++] = 192;
+            rx_buffer[reply_len++] = 168;
+            rx_buffer[reply_len++] = 4;
+            rx_buffer[reply_len++] = 1;
+
+            sendto(socket_fd, rx_buffer.data(), reply_len, 0,
+                   reinterpret_cast<sockaddr *>(&client_addr), client_addr_len);
+        }
+
+        close(socket_fd);
+        dns_task_handle = nullptr;
+        vTaskDelete(nullptr);
+    }
+
+    void start_dns_server()
+    {
+        if (dns_task_handle == nullptr)
+        {
+            xTaskCreate(dns_server_task, "dns_captive", 3072, nullptr, configMAX_PRIORITIES - 7, &dns_task_handle);
+        }
+    }
+
+    // Redirects OS probe requests to root page triggering system popups
+    esp_err_t captive_redirect_handler(httpd_req_t *req)
+    {
+        httpd_resp_set_status(req, "302 Found");
+        httpd_resp_set_hdr(req, "Location", "http://192.168.4.1/");
+        httpd_resp_send(req, nullptr, 0);
+        return ESP_OK;
+    }
 
     int send_websocket_text(const char *payload, int length, TickType_t timeout)
     {
@@ -121,7 +245,11 @@ namespace
         }
         if (xSemaphoreTake(websocket_send_mutex, timeout) != pdTRUE)
             return ESP_ERR_TIMEOUT;
-        const int result = esp_websocket_client_send_text(websocket, payload, length, timeout);
+        int result = ESP_FAIL;
+        if (websocket != nullptr)
+        {
+            result = esp_websocket_client_send_text(websocket, payload, length, timeout);
+        }
         xSemaphoreGive(websocket_send_mutex);
         return result;
     }
@@ -138,9 +266,17 @@ namespace
             cJSON_Delete(body);
             return false;
         }
+
+        char device_id[65]{};
+        if (xSemaphoreTake(config_mutex, pdMS_TO_TICKS(100)) == pdTRUE)
+        {
+            std::strncpy(device_id, config.device_id.data(), sizeof(device_id) - 1);
+            xSemaphoreGive(config_mutex);
+        }
+
         cJSON_AddNumberToObject(root, "protocol_version", 1);
         cJSON_AddStringToObject(root, "message_id", id);
-        cJSON_AddStringToObject(root, "device_id", config.device_id.data());
+        cJSON_AddStringToObject(root, "device_id", device_id);
         cJSON_AddStringToObject(root, "timestamp", "1970-01-01T00:00:00Z");
         cJSON_AddStringToObject(root, "type", "schedule.fired");
         cJSON_AddStringToObject(body, "id", id);
@@ -217,9 +353,17 @@ namespace
             cJSON_Delete(body);
             return;
         }
+
+        char device_id[65]{};
+        if (xSemaphoreTake(config_mutex, pdMS_TO_TICKS(100)) == pdTRUE)
+        {
+            std::strncpy(device_id, config.device_id.data(), sizeof(device_id) - 1);
+            xSemaphoreGive(config_mutex);
+        }
+
         cJSON_AddNumberToObject(root, "protocol_version", 1);
         cJSON_AddStringToObject(root, "message_id", request_id[0] != '\0' ? request_id : "game-event");
-        cJSON_AddStringToObject(root, "device_id", config.device_id.data());
+        cJSON_AddStringToObject(root, "device_id", device_id);
         cJSON_AddStringToObject(root, "timestamp", "1970-01-01T00:00:00Z");
         cJSON_AddStringToObject(root, "type", "game.event");
         cJSON_AddStringToObject(body, "request_id", request_id);
@@ -282,10 +426,18 @@ namespace
             cJSON_AddNumberToObject(item, "duration_seconds", entries[index].duration_seconds);
             cJSON_AddItemToArray(records, item);
         }
+
+        char device_id[65]{};
+        if (xSemaphoreTake(config_mutex, pdMS_TO_TICKS(100)) == pdTRUE)
+        {
+            std::strncpy(device_id, config.device_id.data(), sizeof(device_id) - 1);
+            xSemaphoreGive(config_mutex);
+        }
+
         cJSON_AddItemToObject(body, "records", records);
         cJSON_AddNumberToObject(root, "protocol_version", 1);
         cJSON_AddStringToObject(root, "message_id", "game-history");
-        cJSON_AddStringToObject(root, "device_id", config.device_id.data());
+        cJSON_AddStringToObject(root, "device_id", device_id);
         cJSON_AddStringToObject(root, "timestamp", "1970-01-01T00:00:00Z");
         cJSON_AddStringToObject(root, "type", "game.history");
         cJSON_AddItemToObject(root, "payload", body);
@@ -310,8 +462,12 @@ namespace
         }
         if (xSemaphoreTake(websocket_send_mutex, timeout) != pdTRUE)
             return ESP_ERR_TIMEOUT;
-        const int result = esp_websocket_client_send_bin(
-            websocket, reinterpret_cast<const char *>(payload), length, timeout);
+        int result = ESP_FAIL;
+        if (websocket != nullptr)
+        {
+            result = esp_websocket_client_send_bin(
+                websocket, reinterpret_cast<const char *>(payload), length, timeout);
+        }
         xSemaphoreGive(websocket_send_mutex);
         return result;
     }
@@ -328,13 +484,19 @@ namespace
         {
             std::strftime(timestamp, sizeof(timestamp), "%Y-%m-%dT%H:%M:%SZ", &utc_time);
         }
+        char device_id[65]{};
+        if (xSemaphoreTake(config_mutex, pdMS_TO_TICKS(100)) == pdTRUE)
+        {
+            std::strncpy(device_id, config.device_id.data(), sizeof(device_id) - 1);
+            xSemaphoreGive(config_mutex);
+        }
         const uint64_t message_id = static_cast<uint64_t>(esp_timer_get_time());
         const int length = std::snprintf(
             message, sizeof(message),
             "{\"protocol_version\":1,\"message_id\":\"ota-%llu\",\"device_id\":\"%s\","
             "\"timestamp\":\"%s\",\"type\":\"ota.status\",\"payload\":{"
             "\"release_id\":\"%s\",\"state\":\"%s\",\"progress\":%d,\"version\":\"%s\"}}",
-            static_cast<unsigned long long>(message_id), config.device_id.data(), timestamp,
+            static_cast<unsigned long long>(message_id), device_id, timestamp,
             update.release_id.data(), state, progress, update.version.data());
         if (length > 0 && length < static_cast<int>(sizeof(message)))
         {
@@ -346,7 +508,17 @@ namespace
 
     bool make_http_base_url(char *output, size_t capacity)
     {
-        const char *source = config.backend_url.data();
+        char source[129]{};
+        if (xSemaphoreTake(config_mutex, pdMS_TO_TICKS(100)) == pdTRUE)
+        {
+            std::strncpy(source, config.backend_url.data(), sizeof(source) - 1);
+            xSemaphoreGive(config_mutex);
+        }
+        else
+        {
+            return false;
+        }
+
         const char *replacement = nullptr;
         size_t prefix_length = 0;
         if (std::strncmp(source, "wss://", 6) == 0)
@@ -424,7 +596,15 @@ namespace
             report_ota_status(update, "failed", 0);
             return;
         }
-        esp_err_t result = esp_http_client_set_header(client, "Authorization", config.device_token.data());
+
+        char device_token[129]{};
+        if (xSemaphoreTake(config_mutex, pdMS_TO_TICKS(100)) == pdTRUE)
+        {
+            std::strncpy(device_token, config.device_token.data(), sizeof(device_token) - 1);
+            xSemaphoreGive(config_mutex);
+        }
+
+        esp_err_t result = esp_http_client_set_header(client, "Authorization", device_token);
         if (result == ESP_OK)
             result = esp_http_client_open(client, 0);
         int64_t content_length = result == ESP_OK ? esp_http_client_fetch_headers(client) : -1;
@@ -727,7 +907,6 @@ namespace
         }
         else if (backend.find("://") == std::string::npos)
         {
-            // Default private IPv4 addresses and localhost to ws:// instead of wss://
             if (backend.rfind("192.168.", 0) == 0 || backend.rfind("10.", 0) == 0 ||
                 backend.rfind("172.", 0) == 0 || backend.rfind("localhost", 0) == 0)
             {
@@ -886,6 +1065,13 @@ namespace
         if (result == ESP_OK)
             result = nvs_commit(handle);
         nvs_close(handle);
+
+        if (result == ESP_OK && xSemaphoreTake(config_mutex, pdMS_TO_TICKS(100)) == pdTRUE)
+        {
+            config = value;
+            xSemaphoreGive(config_mutex);
+        }
+
         return result;
     }
 
@@ -900,24 +1086,31 @@ namespace
         nvs_handle_t handle;
         if (nvs_open(NVS_NAMESPACE, NVS_READONLY, &handle) != ESP_OK)
             return false;
+
+        DeviceConfig temp_config{};
         const bool valid =
-            read_config_value(handle, "ssid", config.wifi_ssid.data(), config.wifi_ssid.size()) == ESP_OK &&
-            read_config_value(handle, "password", config.wifi_password.data(), config.wifi_password.size()) == ESP_OK &&
-            read_config_value(handle, "backend", config.backend_url.data(), config.backend_url.size()) == ESP_OK &&
-            read_config_value(handle, "device_id", config.device_id.data(), config.device_id.size()) == ESP_OK &&
-            read_config_value(handle, "token", config.device_token.data(), config.device_token.size()) == ESP_OK;
+            read_config_value(handle, "ssid", temp_config.wifi_ssid.data(), temp_config.wifi_ssid.size()) == ESP_OK &&
+            read_config_value(handle, "password", temp_config.wifi_password.data(), temp_config.wifi_password.size()) == ESP_OK &&
+            read_config_value(handle, "backend", temp_config.backend_url.data(), temp_config.backend_url.size()) == ESP_OK &&
+            read_config_value(handle, "device_id", temp_config.device_id.data(), temp_config.device_id.size()) == ESP_OK &&
+            read_config_value(handle, "token", temp_config.device_token.data(), temp_config.device_token.size()) == ESP_OK;
         if (valid)
         {
-            // Location is optional so devices configured before it existed keep working.
-            read_config_value(handle, "country", config.country.data(), config.country.size());
-            read_config_value(handle, "tz", config.timezone.data(), config.timezone.size());
-            read_config_value(handle, "city", config.city.data(), config.city.size());
+            read_config_value(handle, "country", temp_config.country.data(), temp_config.country.size());
+            read_config_value(handle, "tz", temp_config.timezone.data(), temp_config.timezone.size());
+            read_config_value(handle, "city", temp_config.city.data(), temp_config.city.size());
+
+            if (xSemaphoreTake(config_mutex, pdMS_TO_TICKS(100)) == pdTRUE)
+            {
+                config = temp_config;
+                xSemaphoreGive(config_mutex);
+            }
         }
         nvs_close(handle);
         return valid;
     }
 
-    esp_err_t portal_root(httpd_req_t *request)
+    esp_err_t portal_root_fn(httpd_req_t *request)
     {
         if (!request_is_from_setup_ap(request))
         {
@@ -959,7 +1152,7 @@ o.textContent=await r.text();}
         return httpd_resp_send(request, page, HTTPD_RESP_USE_STRLEN);
     }
 
-    esp_err_t portal_status(httpd_req_t *request)
+    esp_err_t portal_status_fn(httpd_req_t *request)
     {
         if (!request_is_from_setup_ap(request))
         {
@@ -972,25 +1165,31 @@ o.textContent=await r.text();}
             httpd_resp_send_err(request, HTTPD_500_INTERNAL_SERVER_ERROR, "Cannot create status response");
             return ESP_ERR_NO_MEM;
         }
+
+        DeviceConfig current_config{};
+        if (xSemaphoreTake(config_mutex, pdMS_TO_TICKS(100)) == pdTRUE)
+        {
+            current_config = config;
+            xSemaphoreGive(config_mutex);
+        }
+
         cJSON_AddBoolToObject(status, "configured", station_configured);
         cJSON_AddBoolToObject(status, "setup_ap_active", setup_ap_active);
-        cJSON_AddStringToObject(status, "wifi_ssid", saved_config_loaded ? config.wifi_ssid.data() : "");
-        cJSON_AddStringToObject(status, "backend_url", saved_config_loaded ? config.backend_url.data() : "");
-        cJSON_AddStringToObject(status, "device_id", saved_config_loaded ? config.device_id.data() : "");
-        cJSON_AddStringToObject(status, "country", saved_config_loaded ? config.country.data() : "");
-        cJSON_AddStringToObject(status, "timezone", saved_config_loaded ? config.timezone.data() : "");
-        cJSON_AddStringToObject(status, "city", saved_config_loaded ? config.city.data() : "");
+        cJSON_AddStringToObject(status, "wifi_ssid", saved_config_loaded ? current_config.wifi_ssid.data() : "");
+        cJSON_AddStringToObject(status, "backend_url", saved_config_loaded ? current_config.backend_url.data() : "");
+        cJSON_AddStringToObject(status, "device_id", saved_config_loaded ? current_config.device_id.data() : "");
+        cJSON_AddStringToObject(status, "country", saved_config_loaded ? current_config.country.data() : "");
+        cJSON_AddStringToObject(status, "timezone", saved_config_loaded ? current_config.timezone.data() : "");
+        cJSON_AddStringToObject(status, "city", saved_config_loaded ? current_config.city.data() : "");
+
         wifi_ap_record_t ap_info{};
-        const bool station_associated =
-            saved_config_loaded && esp_wifi_sta_get_ap_info(&ap_info) == ESP_OK;
-        const bool station_has_ip =
-            wifi_events != nullptr && (xEventGroupGetBits(wifi_events) & CONNECTED_BIT) != 0;
+        const bool station_associated = saved_config_loaded && esp_wifi_sta_get_ap_info(&ap_info) == ESP_OK;
+        const bool station_has_ip = wifi_events != nullptr && (xEventGroupGetBits(wifi_events) & CONNECTED_BIT) != 0;
         cJSON_AddBoolToObject(status, "station_associated", station_associated);
         cJSON_AddBoolToObject(status, "station_connected", station_has_ip);
         esp_netif_ip_info_t station_ip{};
         esp_netif_t *station_netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
-        if (station_has_ip && station_netif != nullptr &&
-            esp_netif_get_ip_info(station_netif, &station_ip) == ESP_OK)
+        if (station_has_ip && station_netif != nullptr && esp_netif_get_ip_info(station_netif, &station_ip) == ESP_OK)
         {
             char ip_address[IP4ADDR_STRLEN_MAX]{};
             esp_ip4addr_ntoa(&station_ip.ip, ip_address, sizeof(ip_address));
@@ -1013,7 +1212,7 @@ o.textContent=await r.text();}
         return result;
     }
 
-    esp_err_t portal_configure(httpd_req_t *request)
+    esp_err_t portal_configure_fn(httpd_req_t *request)
     {
         if (!request_is_from_setup_ap(request))
         {
@@ -1071,15 +1270,23 @@ o.textContent=await r.text();}
                 "Use a public DNS hostname or https:// / wss:// URL for deployed service, or ws:// with a private LAN IPv4 address and optional port; do not include a path");
             return ESP_FAIL;
         }
-        if (submitted.wifi_password[0] == '\0' && saved_config_loaded &&
-            std::strcmp(submitted.wifi_ssid.data(), config.wifi_ssid.data()) == 0)
+
+        DeviceConfig current_config{};
+        if (xSemaphoreTake(config_mutex, pdMS_TO_TICKS(100)) == pdTRUE)
         {
-            std::strncpy(submitted.wifi_password.data(), config.wifi_password.data(),
+            current_config = config;
+            xSemaphoreGive(config_mutex);
+        }
+
+        if (submitted.wifi_password[0] == '\0' && saved_config_loaded &&
+            std::strcmp(submitted.wifi_ssid.data(), current_config.wifi_ssid.data()) == 0)
+        {
+            std::strncpy(submitted.wifi_password.data(), current_config.wifi_password.data(),
                          submitted.wifi_password.size() - 1);
         }
         if (submitted.device_token[0] == '\0' && saved_config_loaded)
         {
-            std::strncpy(submitted.device_token.data(), config.device_token.data(),
+            std::strncpy(submitted.device_token.data(), current_config.device_token.data(),
                          submitted.device_token.size() - 1);
         }
         bool location_valid = submitted.country[0] == '\0' ||
@@ -1135,6 +1342,9 @@ o.textContent=await r.text();}
 
     esp_err_t start_provisioning_portal()
     {
+        if (setup_ap_active)
+            return ESP_OK;
+
         uint8_t mac[6];
         ESP_RETURN_ON_ERROR(esp_read_mac(mac, ESP_MAC_WIFI_SOFTAP), TAG, "Cannot read Wi-Fi MAC");
         std::snprintf(setup_ssid, sizeof(setup_ssid), "Buddy-Setup-%02X%02X", mac[4], mac[5]);
@@ -1145,22 +1355,44 @@ o.textContent=await r.text();}
             SETUP_AP_PASSWORD);
         ap_config.ap.ssid_len = std::strlen(setup_ssid);
         ap_config.ap.channel = 1;
-        ap_config.ap.max_connection = 2;
+        ap_config.ap.max_connection = 4;
         ap_config.ap.ssid_hidden = 0;
         ap_config.ap.beacon_interval = 100;
         ap_config.ap.authmode = WIFI_AUTH_WPA2_PSK;
         ESP_RETURN_ON_ERROR(esp_wifi_set_config(WIFI_IF_AP, &ap_config), TAG, "Cannot configure setup access point");
 
         httpd_config_t server_config = HTTPD_DEFAULT_CONFIG();
+        server_config.max_uri_handlers = 12; // Expanded to handle all OS detection probes
         httpd_handle_t server = nullptr;
         ESP_RETURN_ON_ERROR(httpd_start(&server, &server_config), TAG, "Cannot start setup portal");
-        httpd_uri_t root = {.uri = "/", .method = HTTP_GET, .handler = portal_root, .user_ctx = nullptr};
-        httpd_uri_t status = {.uri = "/status", .method = HTTP_GET, .handler = portal_status, .user_ctx = nullptr};
-        httpd_uri_t configure = {.uri = "/configure", .method = HTTP_POST, .handler = portal_configure, .user_ctx = nullptr};
+
+        httpd_uri_t root = {.uri = "/", .method = HTTP_GET, .handler = portal_root_fn, .user_ctx = nullptr};
+        httpd_uri_t status = {.uri = "/status", .method = HTTP_GET, .handler = portal_status_fn, .user_ctx = nullptr};
+        httpd_uri_t configure = {.uri = "/configure", .method = HTTP_POST, .handler = portal_configure_fn, .user_ctx = nullptr};
+
+        // Captive Portal detection probes for iOS, macOS, Android, Windows, and Linux
+        httpd_uri_t ios_probe = {.uri = "/hotspot-detect.html", .method = HTTP_GET, .handler = captive_redirect_handler, .user_ctx = nullptr};
+        httpd_uri_t android_probe1 = {.uri = "/generate_204", .method = HTTP_GET, .handler = captive_redirect_handler, .user_ctx = nullptr};
+        httpd_uri_t android_probe2 = {.uri = "/gen_204", .method = HTTP_GET, .handler = captive_redirect_handler, .user_ctx = nullptr};
+        httpd_uri_t win_probe = {.uri = "/connecttest.txt", .method = HTTP_GET, .handler = captive_redirect_handler, .user_ctx = nullptr};
+        httpd_uri_t ncsi_probe = {.uri = "/ncsi.txt", .method = HTTP_GET, .handler = captive_redirect_handler, .user_ctx = nullptr};
+
         ESP_RETURN_ON_ERROR(httpd_register_uri_handler(server, &root), TAG, "Cannot register portal page");
         ESP_RETURN_ON_ERROR(httpd_register_uri_handler(server, &status), TAG, "Cannot register portal status");
         ESP_RETURN_ON_ERROR(httpd_register_uri_handler(server, &configure), TAG, "Cannot register portal configuration");
+
+        // Register captive redirection URIs
+        httpd_register_uri_handler(server, &ios_probe);
+        httpd_register_uri_handler(server, &android_probe1);
+        httpd_register_uri_handler(server, &android_probe2);
+        httpd_register_uri_handler(server, &win_probe);
+        httpd_register_uri_handler(server, &ncsi_probe);
+
         setup_ap_active = true;
+
+        // Launch captive DNS server on port 53
+        start_dns_server();
+
         return ESP_OK;
     }
 
@@ -1168,24 +1400,43 @@ o.textContent=await r.text();}
     {
         if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED)
         {
-            xEventGroupClearBits(wifi_events, CONNECTED_BIT);
+            if (wifi_events != nullptr)
+                xEventGroupClearBits(wifi_events, CONNECTED_BIT);
             const auto *disconnect = static_cast<const wifi_event_sta_disconnected_t *>(event_data);
             if (disconnect != nullptr)
             {
                 ESP_LOGW(
-                    TAG, "Wi-Fi disconnected (reason=%u, rssi=%d dBm); retrying",
+                    TAG, "Wi-Fi disconnected (reason=%u, rssi=%d dBm)",
                     static_cast<unsigned>(disconnect->reason), static_cast<int>(disconnect->rssi));
             }
             else
             {
-                ESP_LOGW(TAG, "Wi-Fi disconnected (reason unavailable); retrying");
+                ESP_LOGW(TAG, "Wi-Fi disconnected (reason unavailable)");
             }
+
             if (station_configured)
-                esp_wifi_connect();
+            {
+                if (wifi_retry_count < MAX_WIFI_RETRIES)
+                {
+                    wifi_retry_count++;
+                    ESP_LOGI(TAG, "Retrying Wi-Fi connection (%d/%d)...", wifi_retry_count, MAX_WIFI_RETRIES);
+                    esp_wifi_connect();
+                }
+                else
+                {
+                    ESP_LOGE(TAG, "Failed to connect to target Wi-Fi after %d attempts. Queueing Setup Portal...", MAX_WIFI_RETRIES);
+                    if (wifi_events != nullptr)
+                    {
+                        xEventGroupSetBits(wifi_events, START_AP_BIT);
+                    }
+                }
+            }
         }
         else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP)
         {
-            xEventGroupSetBits(wifi_events, CONNECTED_BIT);
+            wifi_retry_count = 0;
+            if (wifi_events != nullptr)
+                xEventGroupSetBits(wifi_events, CONNECTED_BIT);
             const auto *event = static_cast<const ip_event_got_ip_t *>(event_data);
             if (event != nullptr)
             {
@@ -1212,6 +1463,14 @@ o.textContent=await r.text();}
         {
             std::strftime(timestamp, sizeof(timestamp), "%Y-%m-%dT%H:%M:%SZ", &utc_time);
         }
+
+        DeviceConfig current_config{};
+        if (xSemaphoreTake(config_mutex, pdMS_TO_TICKS(100)) == pdTRUE)
+        {
+            current_config = config;
+            xSemaphoreGive(config_mutex);
+        }
+
         char message_id[32];
         std::snprintf(message_id, sizeof(message_id), "boot-%llu", static_cast<unsigned long long>(boot_identifier));
         cJSON *root = cJSON_CreateObject();
@@ -1226,14 +1485,14 @@ o.textContent=await r.text();}
         }
         cJSON_AddNumberToObject(root, "protocol_version", 1);
         cJSON_AddStringToObject(root, "message_id", message_id);
-        cJSON_AddStringToObject(root, "device_id", config.device_id.data());
+        cJSON_AddStringToObject(root, "device_id", current_config.device_id.data());
         cJSON_AddStringToObject(root, "timestamp", timestamp);
         cJSON_AddStringToObject(root, "type", "device.hello");
         cJSON_AddStringToObject(payload, "firmware_version", firmware_version);
         cJSON_AddBoolToObject(payload, "simulated", false);
-        cJSON_AddStringToObject(location, "country", config.country.data());
-        cJSON_AddStringToObject(location, "timezone", config.timezone.data());
-        cJSON_AddStringToObject(location, "city", config.city.data());
+        cJSON_AddStringToObject(location, "country", current_config.country.data());
+        cJSON_AddStringToObject(location, "timezone", current_config.timezone.data());
+        cJSON_AddStringToObject(location, "city", current_config.city.data());
         cJSON_AddItemToObject(payload, "location", location);
         cJSON *capabilities = cJSON_CreateArray();
         if (capabilities != nullptr)
@@ -1291,7 +1550,7 @@ o.textContent=await r.text();}
             portEXIT_CRITICAL(&replay_lock);
             if (length == 0)
                 continue;
-            if ((xEventGroupGetBits(websocket_events) & WEBSOCKET_READY_BIT) == 0)
+            if (websocket == nullptr || (xEventGroupGetBits(websocket_events) & WEBSOCKET_READY_BIT) == 0)
                 break;
             const int sent = send_websocket_binary(
                 packet.data(), static_cast<int>(length), AUDIO_SEND_TIMEOUT);
@@ -1309,6 +1568,7 @@ o.textContent=await r.text();}
         if (event_id == WEBSOCKET_EVENT_CONNECTED)
         {
             ESP_LOGI(TAG, "Backend WebSocket connected");
+            xEventGroupSetBits(websocket_events, WEBSOCKET_READY_BIT);
             send_hello();
             send_game_history();
             return;
@@ -1434,13 +1694,19 @@ o.textContent=await r.text();}
                     {
                         std::strftime(timestamp, sizeof(timestamp), "%Y-%m-%dT%H:%M:%SZ", &utc_time);
                     }
+                    char device_id[65]{};
+                    if (xSemaphoreTake(config_mutex, pdMS_TO_TICKS(100)) == pdTRUE)
+                    {
+                        std::strncpy(device_id, config.device_id.data(), sizeof(device_id) - 1);
+                        xSemaphoreGive(config_mutex);
+                    }
                     if (cJSON_IsString(id))
                     {
                         const int length = std::snprintf(
                             pong, sizeof(pong),
                             "{\"protocol_version\":1,\"message_id\":\"%s\",\"device_id\":\"%s\","
                             "\"timestamp\":\"%s\",\"type\":\"pong\",\"payload\":{}}",
-                            id->valuestring, config.device_id.data(), timestamp);
+                            id->valuestring, device_id, timestamp);
                         if (length > 0 && length < static_cast<int>(sizeof(pong)))
                         {
                             send_websocket_text(pong, length, pdMS_TO_TICKS(100));
@@ -1466,13 +1732,19 @@ o.textContent=await r.text();}
                     if (!queue_ota_release(payload))
                     {
                         ESP_LOGE(TAG, "OTA release manifest is invalid or update queue is full");
+                        char device_id[65]{};
+                        if (xSemaphoreTake(config_mutex, pdMS_TO_TICKS(100)) == pdTRUE)
+                        {
+                            std::strncpy(device_id, config.device_id.data(), sizeof(device_id) - 1);
+                            xSemaphoreGive(config_mutex);
+                        }
                         char error[320];
                         const int length = std::snprintf(
                             error, sizeof(error),
                             "{\"protocol_version\":1,\"message_id\":\"ota-invalid\","
                             "\"device_id\":\"%s\",\"timestamp\":\"1970-01-01T00:00:00Z\","
                             "\"type\":\"device.error\",\"payload\":{\"code\":\"invalid_ota_manifest\"}}",
-                            config.device_id.data());
+                            device_id);
                         if (length > 0 && length < static_cast<int>(sizeof(error)))
                         {
                             send_websocket_text(error, length, pdMS_TO_TICKS(100));
@@ -1716,14 +1988,14 @@ o.textContent=await r.text();}
         uint32_t requested_replay = 0;
         while (true)
         {
-            if ((xEventGroupGetBits(websocket_events) & WEBSOCKET_READY_BIT) != 0 &&
+            if (websocket != nullptr && (xEventGroupGetBits(websocket_events) & WEBSOCKET_READY_BIT) != 0 &&
                 xQueueReceive(replay_requests, &requested_replay, 0) == pdTRUE)
             {
                 replay_audio_range(requested_replay);
             }
             if (xQueueReceive(queue, &block, pdMS_TO_TICKS(250)) != pdTRUE)
                 continue;
-            if (!microphone_stream_enabled.load() ||
+            if (!microphone_stream_enabled.load() || websocket == nullptr ||
                 (xEventGroupGetBits(websocket_events) & WEBSOCKET_READY_BIT) == 0)
                 continue;
             if (xQueueReceive(replay_requests, &requested_replay, 0) == pdTRUE)
@@ -1735,7 +2007,6 @@ o.textContent=await r.text();}
                 continue;
             size_t sample_count = block.sample_count;
             std::memcpy(samples.data(), block.samples, sample_count * sizeof(int16_t));
-            // Send up to four 20 ms blocks per packet: a backlog drains in fewer, larger writes.
             for (int merged = 1; merged < 4; ++merged)
             {
                 if (xQueueReceive(queue, &next_block, merged == 1 ? pdMS_TO_TICKS(40) : 0) != pdTRUE)
@@ -1840,9 +2111,16 @@ o.textContent=await r.text();}
                 vTaskDelete(nullptr);
                 return;
             }
+
+            DeviceConfig current_config{};
+            if (xSemaphoreTake(config_mutex, pdMS_TO_TICKS(100)) == pdTRUE)
+            {
+                current_config = config;
+                xSemaphoreGive(config_mutex);
+            }
             wifi_config_t station{};
-            std::memcpy(station.sta.ssid, config.wifi_ssid.data(), std::strlen(config.wifi_ssid.data()));
-            std::memcpy(station.sta.password, config.wifi_password.data(), std::strlen(config.wifi_password.data()));
+            std::memcpy(station.sta.ssid, current_config.wifi_ssid.data(), std::strlen(current_config.wifi_ssid.data()));
+            std::memcpy(station.sta.password, current_config.wifi_password.data(), std::strlen(current_config.wifi_password.data()));
             ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &station));
         }
         ESP_ERROR_CHECK(esp_wifi_start());
@@ -1860,7 +2138,6 @@ o.textContent=await r.text();}
                                          setup_items, 3, 0, 0, 0, 0, 0, nullptr);
             if (portal_session)
             {
-                // A voice-opened portal keeps the saved setup, so return to it if nobody finishes.
                 vTaskDelay(pdMS_TO_TICKS(PORTAL_SESSION_TIMEOUT_MS));
                 ESP_LOGW(TAG, "Setup portal timed out; restarting with the saved configuration");
                 esp_restart();
@@ -1878,20 +2155,19 @@ o.textContent=await r.text();}
         }
         ESP_LOGI(TAG, "Wi-Fi power save disabled for continuous audio streaming");
         ESP_ERROR_CHECK(esp_wifi_connect());
-        const EventBits_t connection_bits = xEventGroupWaitBits(
+
+        const EventBits_t initial_bits = xEventGroupWaitBits(
             wifi_events, CONNECTED_BIT, pdFALSE, pdTRUE, pdMS_TO_TICKS(10000));
-        if ((connection_bits & CONNECTED_BIT) == 0)
+        if ((initial_bits & CONNECTED_BIT) == 0)
         {
             ESP_LOGW(TAG, "Station has not received an IP within 10 seconds; enabling setup access point");
             ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_APSTA));
             ESP_ERROR_CHECK(start_provisioning_portal());
             ESP_LOGI(TAG, "Setup access point started after station timeout; SSID: %s; dashboard: http://192.168.4.1/",
                      setup_ssid);
-            xEventGroupWaitBits(wifi_events, CONNECTED_BIT, pdFALSE, pdTRUE, portMAX_DELAY);
         }
 
         {
-            // The local alarm scheduler needs wall-clock time even with an unencrypted backend.
             const esp_sntp_config_t sntp_config = ESP_NETIF_SNTP_DEFAULT_CONFIG("pool.ntp.org");
             esp_err_t time_result = esp_netif_sntp_init(&sntp_config);
             if (time_result == ESP_OK)
@@ -1906,86 +2182,125 @@ o.textContent=await r.text();}
             }
         }
 
-        // Re-validate and normalize the value loaded from NVS before building the URL.
-        // This also migrates old http(s) origins to ws(s) consistently.
-        char normalized_backend[129]{};
-        if (!normalize_backend_origin(config.backend_url.data(), normalized_backend,
-                                      sizeof(normalized_backend)))
+        // Supervisor loop for dynamic WebSocket client creation and AP portal activation
+        while (true)
         {
-            ESP_LOGE(TAG, "Invalid backend origin stored in NVS: '%s'", config.backend_url.data());
-            vTaskDelete(nullptr);
-            return;
+            const EventBits_t bits = xEventGroupWaitBits(
+                wifi_events, CONNECTED_BIT | START_AP_BIT, pdFALSE, pdFALSE, pdMS_TO_TICKS(2000));
+
+            if ((bits & START_AP_BIT) != 0)
+            {
+                xEventGroupClearBits(wifi_events, START_AP_BIT);
+                if (!setup_ap_active)
+                {
+                    esp_wifi_set_mode(WIFI_MODE_APSTA);
+                    start_provisioning_portal();
+                    char ssid_line[40];
+                    std::snprintf(ssid_line, sizeof(ssid_line), "Wi-Fi: %s", setup_ssid);
+                    char password_line[40];
+                    std::snprintf(password_line, sizeof(password_line), "Pass: %s", SETUP_AP_PASSWORD);
+                    const char *setup_items[] = {ssid_line, password_line, "Open 192.168.4.1"};
+                    DeviceDisplay::set_dashboard("notifications", "SETUP MODE", "Wi-Fi lost. Join AP",
+                                                 setup_items, 3, 0, 0, 0, 0, 0, nullptr);
+                }
+            }
+
+            if ((bits & CONNECTED_BIT) == 0)
+            {
+                if (websocket != nullptr)
+                {
+                    ESP_LOGW(TAG, "Wi-Fi connectivity lost; destroying WebSocket client instance");
+                    xSemaphoreTake(websocket_send_mutex, portMAX_DELAY);
+                    esp_websocket_client_stop(websocket);
+                    esp_websocket_client_destroy(websocket);
+                    websocket = nullptr;
+                    xSemaphoreGive(websocket_send_mutex);
+                    xEventGroupClearBits(websocket_events, WEBSOCKET_READY_BIT);
+                }
+                vTaskDelay(pdMS_TO_TICKS(1000));
+                continue;
+            }
+
+            if (websocket == nullptr)
+            {
+                DeviceConfig current_config{};
+                if (xSemaphoreTake(config_mutex, pdMS_TO_TICKS(100)) == pdTRUE)
+                {
+                    current_config = config;
+                    xSemaphoreGive(config_mutex);
+                }
+
+                char normalized_backend[129]{};
+                if (!normalize_backend_origin(current_config.backend_url.data(), normalized_backend,
+                                              sizeof(normalized_backend)))
+                {
+                    ESP_LOGE(TAG, "Invalid backend origin stored in NVS: '%s'", current_config.backend_url.data());
+                    vTaskDelay(pdMS_TO_TICKS(5000));
+                    continue;
+                }
+
+                const bool secure_backend = std::strncmp(normalized_backend, "wss://", 6) == 0;
+                const size_t backend_length = std::strlen(normalized_backend);
+                const size_t origin_length = backend_length > 0 && normalized_backend[backend_length - 1] == '/'
+                                                 ? backend_length - 1
+                                                 : backend_length;
+                char uri[320]{};
+                const int uri_length = std::snprintf(
+                    uri, sizeof(uri), "%.*s/api/v1/ws/devices/%s/audio",
+                    static_cast<int>(origin_length), normalized_backend, current_config.device_id.data());
+
+                char headers[180]{};
+                const int header_length = std::snprintf(
+                    headers, sizeof(headers), "Authorization: Bearer %s\r\n", current_config.device_token.data());
+
+                if (uri_length <= 0 || uri_length >= static_cast<int>(sizeof(uri)) ||
+                    header_length <= 0 || header_length >= static_cast<int>(sizeof(headers)))
+                {
+                    ESP_LOGE(TAG, "WebSocket URI or headers formatted invalidly");
+                    vTaskDelay(pdMS_TO_TICKS(5000));
+                    continue;
+                }
+
+                ESP_LOGI(TAG, "Initializing fresh WebSocket client instance for %s", uri);
+                esp_websocket_client_config_t ws_config{};
+                ws_config.uri = uri;
+                ws_config.headers = headers;
+                ws_config.buffer_size = 4096;
+                ws_config.task_stack = 10240;
+                ws_config.ping_interval_sec = 20;
+                ws_config.network_timeout_ms = 15000;
+                ws_config.reconnect_timeout_ms = 5000;
+                ws_config.disable_auto_reconnect = false;
+
+                if (secure_backend)
+                {
+                    ws_config.crt_bundle_attach = esp_crt_bundle_attach;
+                    ws_config.transport = WEBSOCKET_TRANSPORT_OVER_SSL;
+                }
+                else
+                {
+                    ws_config.crt_bundle_attach = nullptr;
+                    ws_config.transport = WEBSOCKET_TRANSPORT_OVER_TCP;
+                }
+
+                xSemaphoreTake(websocket_send_mutex, portMAX_DELAY);
+                websocket = esp_websocket_client_init(&ws_config);
+                if (websocket != nullptr)
+                {
+                    esp_websocket_register_events(websocket, WEBSOCKET_EVENT_ANY, websocket_event_handler, nullptr);
+                    esp_websocket_client_start(websocket);
+                }
+                else
+                {
+                    ESP_LOGE(TAG, "Failed to create WebSocket client");
+                }
+                xSemaphoreGive(websocket_send_mutex);
+            }
+            else if (!esp_websocket_client_is_connected(websocket))
+            {
+                ESP_LOGD(TAG, "WebSocket client exists but disconnected; reconnection in progress");
+            }
         }
-
-        const bool secure_backend = std::strncmp(normalized_backend, "wss://", 6) == 0;
-        const size_t backend_length = std::strlen(normalized_backend);
-        const size_t origin_length = backend_length > 0 && normalized_backend[backend_length - 1] == '/'
-                                         ? backend_length - 1
-                                         : backend_length;
-        char uri[320]{};
-        const int uri_length = std::snprintf(
-            uri, sizeof(uri), "%.*s/api/v1/ws/devices/%s/audio",
-            static_cast<int>(origin_length), normalized_backend, config.device_id.data());
-        if (uri_length <= 0 || uri_length >= static_cast<int>(sizeof(uri)))
-        {
-            ESP_LOGE(TAG, "WebSocket endpoint is too long; check backend origin and device ID");
-            vTaskDelete(nullptr);
-            return;
-        }
-
-        char headers[180]{};
-        const int header_length = std::snprintf(
-            headers, sizeof(headers), "Authorization: Bearer %s\r\n", config.device_token.data());
-        if (header_length <= 0 || header_length >= static_cast<int>(sizeof(headers)))
-        {
-            ESP_LOGE(TAG, "Device authorization header is too long");
-            vTaskDelete(nullptr);
-            return;
-        }
-
-        ESP_LOGI(TAG, "Starting backend WebSocket connection");
-        ESP_LOGI(TAG, "Backend origin: %s", normalized_backend);
-        ESP_LOGI(TAG, "WebSocket endpoint: %s", uri);
-        ESP_LOGI(TAG, "Transport: %s", secure_backend ? "WSS/TLS" : "WS/TCP");
-        if (!secure_backend)
-            ESP_LOGW(TAG, "Using unencrypted local WebSocket backend; use only on a trusted LAN");
-
-        esp_websocket_client_config_t ws_config{};
-        ws_config.uri = uri;
-        ws_config.headers = headers;
-        ws_config.buffer_size = 4096;
-        ws_config.task_stack = 10240;
-        ws_config.ping_interval_sec = 20;
-        // Allow a little more time for a busy LAN/server startup. This does not
-        // replace the requirement that the backend be reachable on this port.
-        ws_config.network_timeout_ms = 15000;
-        ws_config.reconnect_timeout_ms = 5000;
-        ws_config.disable_auto_reconnect = false;
-
-        if (secure_backend)
-        {
-            ws_config.crt_bundle_attach = esp_crt_bundle_attach;
-            ws_config.transport = WEBSOCKET_TRANSPORT_OVER_SSL;
-        }
-        else
-        {
-            ws_config.crt_bundle_attach = nullptr;
-            ws_config.transport = WEBSOCKET_TRANSPORT_OVER_TCP;
-        }
-
-        websocket = esp_websocket_client_init(&ws_config);
-        if (websocket == nullptr)
-        {
-            ESP_LOGE(TAG, "Cannot create WebSocket client for %s", uri);
-            vTaskDelete(nullptr);
-            return;
-        }
-
-        ESP_ERROR_CHECK(esp_websocket_register_events(
-            websocket, WEBSOCKET_EVENT_ANY, websocket_event_handler, nullptr));
-        ESP_ERROR_CHECK(esp_websocket_client_start(websocket));
-
-        vTaskDelete(nullptr);
     }
 
 }
@@ -1995,22 +2310,40 @@ namespace DeviceNetwork
 
     bool camera_endpoint(char *url, size_t url_capacity, char *authorization, size_t authorization_capacity)
     {
-        if (!saved_config_loaded || !station_configured || config.device_token[0] == '\0' ||
-            (xEventGroupGetBits(wifi_events) & CONNECTED_BIT) == 0)
+        DeviceConfig current_config{};
+        if (xSemaphoreTake(config_mutex, pdMS_TO_TICKS(100)) == pdTRUE)
+        {
+            current_config = config;
+            xSemaphoreGive(config_mutex);
+        }
+        else
+        {
+            return false;
+        }
+
+        if (!saved_config_loaded || !station_configured || current_config.device_token[0] == '\0' ||
+            wifi_events == nullptr || (xEventGroupGetBits(wifi_events) & CONNECTED_BIT) == 0)
         {
             return false;
         }
         char base[192]{};
         if (!make_http_base_url(base, sizeof(base)))
             return false;
-        const int url_length = std::snprintf(url, url_capacity, "%s/api/v1/vision/frames/%s", base, config.device_id.data());
-        const int auth_length = std::snprintf(authorization, authorization_capacity, "Bearer %s", config.device_token.data());
+        const int url_length = std::snprintf(url, url_capacity, "%s/api/v1/vision/frames/%s", base, current_config.device_id.data());
+        const int auth_length = std::snprintf(authorization, authorization_capacity, "Bearer %s", current_config.device_token.data());
         return url_length > 0 && url_length < static_cast<int>(url_capacity) &&
                auth_length > 0 && auth_length < static_cast<int>(authorization_capacity);
     }
 
     esp_err_t start()
     {
+        if (config_mutex == nullptr)
+        {
+            config_mutex = xSemaphoreCreateMutex();
+            if (config_mutex == nullptr)
+                return ESP_ERR_NO_MEM;
+        }
+
         esp_err_t result = nvs_flash_init();
         if (result == ESP_ERR_NVS_NO_FREE_PAGES || result == ESP_ERR_NVS_NEW_VERSION_FOUND)
         {
@@ -2034,7 +2367,15 @@ namespace DeviceNetwork
         if (result != ESP_OK)
             return result;
         saved_config_loaded = load_config();
-        station_configured = saved_config_loaded && is_supported_backend_origin(config.backend_url.data());
+
+        char backend[129]{};
+        if (xSemaphoreTake(config_mutex, pdMS_TO_TICKS(100)) == pdTRUE)
+        {
+            std::strncpy(backend, config.backend_url.data(), sizeof(backend) - 1);
+            xSemaphoreGive(config_mutex);
+        }
+
+        station_configured = saved_config_loaded && is_supported_backend_origin(backend);
         {
             nvs_handle_t flag_handle;
             if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &flag_handle) == ESP_OK)
