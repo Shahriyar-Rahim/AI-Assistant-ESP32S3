@@ -3,7 +3,7 @@ idf_component_register(
         "main.cpp" 
         "audio_i2s.cpp" 
         "device_network.cpp" 
-        "device_display.cpp" 
+        "device_display.cpp"  
         "device_games.cpp" 
         "device_schedule.cpp" 
         "device_camera.cpp"
@@ -28,6 +28,7 @@ idf_component_register(
         esp_http_client 
         app_update 
         cjson 
+        lvgl
         esp_websocket_client 
         mbedtls
 )

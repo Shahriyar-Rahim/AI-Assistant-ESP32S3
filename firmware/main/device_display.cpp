@@ -11,6 +11,7 @@
 #include "driver/i2c_master.h"
 #include "driver/spi_master.h"
 #include "esp_check.h"
+#include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
@@ -25,6 +26,11 @@ namespace
     constexpr size_t WIDTH = 128;
     constexpr size_t HEIGHT = 160;
     constexpr size_t PIXELS_PER_ROW = WIDTH;
+
+    // Correct hardware offsets for 1.8" ST7735 128x160 TFT modules
+    constexpr uint8_t ST7735_X_OFFSET = 0;
+    constexpr uint8_t ST7735_Y_OFFSET = 0;
+
     constexpr uint16_t COLOR_BACKGROUND = 0x0861;
     constexpr uint16_t COLOR_FACE = 0xFFE0;
     constexpr uint16_t COLOR_FEATURE = 0x1082;
@@ -51,7 +57,10 @@ namespace
     i2c_master_dev_handle_t oled_device = nullptr;
 
     std::array<uint16_t, WIDTH * HEIGHT> frame_buffer{};
-    std::array<uint8_t, PIXELS_PER_ROW * 2> row_buffer{};
+
+    // Heap-allocated DMA safe memory buffer for SPI transfers
+    uint8_t *dma_row_buffer = nullptr;
+
     std::array<uint8_t, OLED_WIDTH * OLED_HEIGHT / 8> oled_frame_buffer{};
     std::array<uint8_t, 17> oled_transfer_buffer{};
     SemaphoreHandle_t display_mutex = nullptr;
@@ -199,34 +208,36 @@ namespace
     esp_err_t flush_tft_region(size_t x, size_t y, size_t width, size_t height)
     {
         if (active_panel != Panel::Tft || width == 0 || height == 0 ||
-            x + width > WIDTH || y + height > HEIGHT || width > PIXELS_PER_ROW)
+            x + width > WIDTH || y + height > HEIGHT || dma_row_buffer == nullptr)
         {
             return ESP_ERR_INVALID_ARG;
         }
+
+        const uint16_t x_start = static_cast<uint16_t>(x + ST7735_X_OFFSET);
+        const uint16_t x_end = static_cast<uint16_t>(x + width - 1 + ST7735_X_OFFSET);
+        const uint16_t y_start = static_cast<uint16_t>(y + ST7735_Y_OFFSET);
+        const uint16_t y_end = static_cast<uint16_t>(y + height - 1 + ST7735_Y_OFFSET);
+
         const uint8_t columns[] = {
-            0,
-            static_cast<uint8_t>(x),
-            0,
-            static_cast<uint8_t>(x + width - 1),
-        };
+            static_cast<uint8_t>(x_start >> 8), static_cast<uint8_t>(x_start & 0xFF),
+            static_cast<uint8_t>(x_end >> 8), static_cast<uint8_t>(x_end & 0xFF)};
         const uint8_t rows[] = {
-            0,
-            static_cast<uint8_t>(y),
-            0,
-            static_cast<uint8_t>(y + height - 1),
-        };
+            static_cast<uint8_t>(y_start >> 8), static_cast<uint8_t>(y_start & 0xFF),
+            static_cast<uint8_t>(y_end >> 8), static_cast<uint8_t>(y_end & 0xFF)};
+
         ESP_RETURN_ON_ERROR(command_data(0x2A, columns, sizeof(columns)), TAG, "Cannot set display columns");
         ESP_RETURN_ON_ERROR(command_data(0x2B, rows, sizeof(rows)), TAG, "Cannot set display rows");
         ESP_RETURN_ON_ERROR(command(0x2C), TAG, "Cannot start display memory write");
+
         for (size_t row = y; row < y + height; ++row)
         {
             for (size_t column = 0; column < width; ++column)
             {
                 const uint16_t pixel = frame_buffer[row * WIDTH + x + column];
-                row_buffer[column * 2] = static_cast<uint8_t>(pixel >> 8);
-                row_buffer[column * 2 + 1] = static_cast<uint8_t>(pixel);
+                dma_row_buffer[column * 2] = static_cast<uint8_t>(pixel >> 8);
+                dma_row_buffer[column * 2 + 1] = static_cast<uint8_t>(pixel & 0xFF);
             }
-            ESP_RETURN_ON_ERROR(data(row_buffer.data(), width * 2), TAG, "Cannot transfer display row");
+            ESP_RETURN_ON_ERROR(data(dma_row_buffer, width * 2), TAG, "Cannot transfer display row");
         }
         return ESP_OK;
     }
@@ -1041,8 +1052,8 @@ namespace
 
     esp_err_t set_addressing()
     {
-        const uint8_t color_mode = 0x05;
-        const uint8_t orientation = 0xC8;
+        const uint8_t color_mode = 0x05;  // 16-bit RGB565
+        const uint8_t orientation = 0xC0; // Fixed MADCTL for standard 128x160 vertical scanning (MY=1, MX=1)
         ESP_RETURN_ON_ERROR(command_data(0x3A, &color_mode, sizeof(color_mode)), TAG, "Cannot set RGB565 mode");
         ESP_RETURN_ON_ERROR(command_data(0x36, &orientation, sizeof(orientation)), TAG, "Cannot set display orientation");
         return ESP_OK;
@@ -1074,14 +1085,30 @@ namespace DeviceDisplay
         if constexpr (!HardwareConfig::Features::ENABLE_TFT)
             return ESP_ERR_NOT_FOUND;
         active_panel = Panel::Tft;
+
+        // Allocate DMA-capable memory for line transfers
+        dma_row_buffer = static_cast<uint8_t *>(
+            heap_caps_malloc(WIDTH * 2, MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL));
+        if (dma_row_buffer == nullptr)
+        {
+            ESP_LOGE(TAG, "Failed to allocate DMA row buffer");
+            return ESP_ERR_NO_MEM;
+        }
+
+        // Configure DC, RST, and BACKLIGHT Control Pins
         gpio_config_t control_pins{};
         control_pins.pin_bit_mask =
-            (1ULL << HardwareConfig::TFT::DC) | (1ULL << HardwareConfig::TFT::RST);
+            (1ULL << HardwareConfig::TFT::DC) |
+            (1ULL << HardwareConfig::TFT::RST) |
+            (1ULL << HardwareConfig::TFT::BACKLIGHT);
         control_pins.mode = GPIO_MODE_OUTPUT;
         control_pins.pull_up_en = GPIO_PULLUP_DISABLE;
         control_pins.pull_down_en = GPIO_PULLDOWN_DISABLE;
         control_pins.intr_type = GPIO_INTR_DISABLE;
         ESP_RETURN_ON_ERROR(gpio_config(&control_pins), TAG, "Cannot configure display control pins");
+
+        // Drive Backlight Pin HIGH
+        ESP_RETURN_ON_ERROR(gpio_set_level(HardwareConfig::TFT::BACKLIGHT, 1), TAG, "Cannot turn backlight on");
 
         spi_bus_config_t bus_config{};
         bus_config.mosi_io_num = HardwareConfig::TFT::MOSI;
@@ -1089,16 +1116,16 @@ namespace DeviceDisplay
         bus_config.sclk_io_num = HardwareConfig::TFT::SCK;
         bus_config.quadwp_io_num = -1;
         bus_config.quadhd_io_num = -1;
-        bus_config.max_transfer_sz = PIXELS_PER_ROW * 2;
+        bus_config.max_transfer_sz = WIDTH * HEIGHT * 2;
         esp_err_t result = spi_bus_initialize(HardwareConfig::TFT::SPI_HOST, &bus_config, SPI_DMA_CH_AUTO);
         if (result != ESP_OK)
             return result;
 
         spi_device_interface_config_t device_config{};
-        device_config.clock_speed_hz = 20 * 1000 * 1000;
+        device_config.clock_speed_hz = 4 * 1000 * 1000; // 4 MHz clock for stable breadboard transfers
         device_config.mode = 0;
         device_config.spics_io_num = HardwareConfig::TFT::CS;
-        device_config.queue_size = 1;
+        device_config.queue_size = 7;
         result = spi_bus_add_device(HardwareConfig::TFT::SPI_HOST, &device_config, &display_device);
         if (result != ESP_OK)
             return result;
@@ -1159,6 +1186,7 @@ namespace DeviceDisplay
             0x02,
             0x10,
         };
+
         ESP_RETURN_ON_ERROR(command_data(0xB1, frame_rate, sizeof(frame_rate)), TAG, "Cannot set frame rate");
         ESP_RETURN_ON_ERROR(command_data(0xB2, frame_rate_idle, sizeof(frame_rate_idle)), TAG, "Cannot set idle frame rate");
         ESP_RETURN_ON_ERROR(command_data(0xB3, frame_rate_partial, sizeof(frame_rate_partial)), TAG, "Cannot set partial frame rate");
@@ -1169,6 +1197,8 @@ namespace DeviceDisplay
         ESP_RETURN_ON_ERROR(command_data(0xC3, power_4, sizeof(power_4)), TAG, "Cannot set power control");
         ESP_RETURN_ON_ERROR(command_data(0xC4, power_5, sizeof(power_5)), TAG, "Cannot set power control");
         ESP_RETURN_ON_ERROR(command_data(0xC5, &vcom, sizeof(vcom)), TAG, "Cannot set VCOM");
+
+        // Use 0x20 to disable inversion (INVOFF) for black background
         ESP_RETURN_ON_ERROR(command(0x20), TAG, "Cannot disable display inversion");
         ESP_RETURN_ON_ERROR(set_addressing(), TAG, "Cannot configure display addressing");
         ESP_RETURN_ON_ERROR(command_data(0xE0, gamma_positive, sizeof(gamma_positive)), TAG, "Cannot set positive gamma");
