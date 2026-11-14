@@ -1,10 +1,12 @@
 FROM python:3.11-slim
 
-ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1
 
 WORKDIR /app
 
-# 1. Install system dependencies
+# 1. Install system dependencies for audio, OpenCV, eSpeak/Piper, and C extensions
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     ffmpeg \
@@ -16,20 +18,31 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
     && rm -rf /var/lib/apt/lists/*
 
-# 2. Copy requirement files
+# 2. Copy all active requirement files
 COPY backend/requirements.txt ./requirements.txt
+COPY backend/requirements-voice.txt ./requirements-voice.txt
+COPY backend/requirements-vision.txt ./requirements-vision.txt
+COPY backend/requirements-gestures.txt ./requirements-gestures.txt
 COPY backend/requirements-wakeword.txt ./requirements-wakeword.txt
 COPY backend/requirements-mem0.txt ./requirements-mem0.txt
 
-# 3. Install core dependencies, helper packages (tqdm, requests), then openwakeword
-RUN pip install --no-cache-dir -r requirements.txt -r requirements-mem0.txt \
+# 3. Pre-install CPU-only PyTorch so resemblyzer/voice doesn't pull multi-GB CUDA/NVIDIA wheels,
+#    then install core + subsystem requirements, and finally openwakeword with --no-deps
+RUN pip install --no-cache-dir --upgrade pip \
+    && pip install --no-cache-dir torch torchaudio --index-url https://download.pytorch.org/whl/cpu \
+    && pip install --no-cache-dir \
+        -r requirements.txt \
+        -r requirements-voice.txt \
+        -r requirements-vision.txt \
+        -r requirements-gestures.txt \
+        -r requirements-mem0.txt \
     && pip install --no-cache-dir onnxruntime scikit-learn tqdm requests \
-    && pip install --no-cache-dir --no-deps openwakeword>=0.6.0
+    && pip install --no-cache-dir --no-deps "openwakeword>=0.6.0"
 
 # 4. Download base wake word models
 RUN python -c "import openwakeword; openwakeword.utils.download_models()"
 
-# 5. Copy backend application files
+# 5. Copy backend application files (including app/models and voices)
 COPY backend/ .
 
 EXPOSE 8000
