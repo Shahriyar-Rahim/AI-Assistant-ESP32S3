@@ -72,7 +72,7 @@ namespace
     constexpr size_t AUDIO_HEADER_SIZE = 25;
     constexpr size_t MAX_AUDIO_FRAME_SAMPLES = HardwareConfig::Audio::CAPTURE_SAMPLES * 4;
     constexpr size_t MAX_PACKET_SIZE = AUDIO_HEADER_SIZE + MAX_AUDIO_FRAME_SAMPLES * sizeof(int16_t);
-    constexpr uint32_t AUDIO_UPLINK_STACK_BYTES = 12 * 1024;
+    constexpr uint32_t AUDIO_UPLINK_STACK_BYTES = 16 * 1024;
     constexpr size_t CONTROL_BUFFER_SIZE = 2048;
     constexpr size_t REPLAY_WINDOW_SIZE = 8;
     constexpr size_t OTA_CHUNK_SIZE = 2048;
