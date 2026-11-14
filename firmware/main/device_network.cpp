@@ -50,6 +50,22 @@ namespace
     constexpr EventBits_t START_AP_BIT = BIT1;
     constexpr EventBits_t WEBSOCKET_READY_BIT = BIT2;
 
+    constexpr char RENDER_ROOT_CA_PEM[] = R"EOF(MIICnzCCAiWgAwIBAgIQf/MZd5csIkp2FV0TttaF4zAKBggqhkjOPQQDAzBHMQsw
+    CQYDVQQGEwJVUzEiMCAGA1UEChMZR29vZ2xlIFRydXN0IFNlcnZpY2VzIExMQzEU
+    MBIGA1UEAxMLR1RTIFJvb3QgUjQwHhcNMjMxMjEzMDkwMDAwWhcNMjkwMjIwMTQw
+    MDAwWjA7MQswCQYDVQQGEwJVUzEeMBwGA1UEChMVR29vZ2xlIFRydXN0IFNlcnZp
+    Y2VzMQwwCgYDVQQDEwNXRTEwWTATBgcqhkjOPQIBBggqhkjOPQMBBwNCAARvzTr+
+    Z1dHTCEDhUDCR127WEcPQMFcF4XGGTfn1XzthkubgdnXGhOlCgP4mMTG6J7/EFmP
+    LCaY9eYmJbsPAvpWo4H+MIH7MA4GA1UdDwEB/wQEAwIBhjAdBgNVHSUEFjAUBggr
+    BgEFBQcDAQYIKwYBBQUHAwIwEgYDVR0TAQH/BAgwBgEB/wIBADAdBgNVHQ4EFgQU
+    kHeSNWfE/6jMqeZ72YB5e8yT+TgwHwYDVR0jBBgwFoAUgEzW63T/STaj1dj8tT7F
+    avCUHYwwNAYIKwYBBQUHAQEEKDAmMCQGCCsGAQUFBzAChhhodHRwOi8vaS5wa2ku
+    Z29vZy9yNC5jcnQwKwYDVR0fBCQwIjAgoB6gHIYaaHR0cDovL2MucGtpLmdvb2cv
+    ci9yNC5jcmwwEwYDVR0gBAwwCjAIBgZngQwBAgEwCgYIKoZIzj0EAwMDaAAwZQIx
+    AOcCq1HW90OVznX+0RGU1cxAQXomvtgM8zItPZCuFQ8jSBJSjz5keROv9aYsAm5V
+    sQIwJonMaAFi54mrfhfoFNZEfuNMSQ6/bIBiNLiyoX46FohQvKeIoJ99cx7sUkFN
+    7uJW)EOF";
+
     constexpr size_t AUDIO_HEADER_SIZE = 25;
     constexpr size_t MAX_AUDIO_FRAME_SAMPLES = HardwareConfig::Audio::CAPTURE_SAMPLES * 4;
     constexpr size_t MAX_PACKET_SIZE = AUDIO_HEADER_SIZE + MAX_AUDIO_FRAME_SAMPLES * sizeof(int16_t);
@@ -2301,7 +2317,8 @@ o.textContent=await r.text();}
 
                 if (secure_backend)
                 {
-                    ws_config.crt_bundle_attach = esp_crt_bundle_attach;
+                    ws_config.cert_pem = RENDER_ROOT_CA_PEM;
+                    ws_config.crt_bundle_attach = nullptr;
                     ws_config.transport = WEBSOCKET_TRANSPORT_OVER_SSL;
                 }
                 else
