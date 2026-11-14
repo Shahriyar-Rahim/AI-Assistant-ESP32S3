@@ -76,8 +76,8 @@ async def _dispatch(application, monitor, user_id: str | None, text: str) -> str
 
     if _ENROLL_OWNER.search(text):
         name = await asyncio.to_thread(local_brain.user_name, factory, user_id) or "Owner"
-        await monitor.enroll(name, "owner")
-        return f"Got it, {name}. I'll recognise you from now on and say hello when you come in."
+        monitor.start_voice_enrollment(name)
+        return "I'll collect face samples for 60 seconds. Please stay alone in view and turn your head slowly."
 
     if match := _FORGET_FACE.search(text):
         person = await asyncio.to_thread(store.find_identity, factory, _clean_name(match.group(1) or match.group(2)))

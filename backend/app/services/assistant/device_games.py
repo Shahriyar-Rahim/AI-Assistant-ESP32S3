@@ -45,6 +45,11 @@ _EXTRA_NAMES = {
     "tic tac tow": "tic_tac_toe",
     "noughts and crosses": "tic_tac_toe",
     "rock paper scissors": "rock_paper_scissors",
+    "dice": "dice",
+    "die": "dice",
+    "roulette": "roulette",
+    "decision symbols": "symbols",
+    "symbols": "symbols",
 }
 
 
@@ -84,6 +89,13 @@ def parse_game_command(text: str, active: bool) -> tuple[str, str | None] | None
         return "list", None
     if not active and re.fullmatch(r"(?:please\s+)?(?:play|start)\s+(?:again|another(?:\s+game)?|a\s+gain)|another\s+game", lowered):
         return "list", None
+    if not active:
+        if re.fullmatch(r"(?:please\s+)?roll\s+(?:(?:a|the)\s+)?(?:die|dice)(?:\s+please)?", lowered):
+            return "start", "dice"
+        if re.fullmatch(r"(?:please\s+)?spin\s+(?:(?:the|a)\s+)?(?:roulette|roulette wheel)(?:\s+please)?", lowered):
+            return "start", "roulette"
+        if re.fullmatch(r"(?:please\s+)?(?:choose|pick|draw)\s+(?:(?:a|the)\s+)?(?:decision\s+)?symbol(?:\s+please)?", lowered):
+            return "start", "symbols"
     names = {**GAME_ALIASES, **_EXTRA_NAMES}
     for spoken, game in names.items():
         if re.search(rf"\b{_START_VERB}\s+(?:a\s+|the\s+|some\s+)?(?:game\s+of\s+)?{re.escape(spoken)}\b", lowered):

@@ -42,6 +42,10 @@ class PersonUpdate(BaseModel):
     role: Literal["owner", "known", "stranger"] | None = None
 
 
+class PersonMerge(BaseModel):
+    target_id: str = Field(min_length=1, max_length=36)
+
+
 class MemoryCreate(BaseModel):
     kind: Literal["home", "text"]
     label: str = Field(min_length=1, max_length=120)
@@ -97,6 +101,16 @@ async def update_person(identity_id: str, payload: PersonUpdate, request: Reques
         raise HTTPException(404, "Person not found")
     await _monitor(request).reload()
     return {"updated": True}
+
+
+@router.post("/people/{identity_id}/merge")
+async def merge_person(identity_id: str, payload: PersonMerge, request: Request, user=Depends(require_user)) -> dict:
+    try:
+        await asyncio.to_thread(store.merge_identities, request.app.state.db_factory, identity_id, payload.target_id)
+    except ValueError as error:
+        raise HTTPException(409, str(error)) from error
+    await _monitor(request).reload()
+    return {"merged": True, "target_id": payload.target_id}
 
 
 @router.delete("/people/{identity_id}")

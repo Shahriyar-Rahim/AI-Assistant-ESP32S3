@@ -12,7 +12,7 @@ from pydantic import BaseModel, Field, model_validator
 from sqlalchemy import select
 
 from app.api.dependencies import require_user
-from app.models import AuditLog, CalendarEvent, Note, Notification, Reminder, Todo, User
+from app.models import AuditLog, CalendarEvent, Note, Notification, Reminder, Todo, TodoList, TodoListMember, User
 
 router = APIRouter(dependencies=[Depends(require_user)])
 EventKind = Literal["event", "meeting", "birthday", "function", "alarm"]
@@ -107,6 +107,10 @@ class TodoCreate(BaseModel):
         if self.due_at is not None and (self.due_at.tzinfo is None or self.due_at.utcoffset() is None):
             raise ValueError("due_at must include a UTC offset")
         return self
+
+
+class TodoListCreate(BaseModel):
+    title: str = Field(min_length=1, max_length=200)
 
 
 def _timezone(name: str) -> ZoneInfo:
@@ -372,20 +376,58 @@ def list_todos(
     _: User = Depends(require_user),
 ) -> dict[str, object]:
     with request.app.state.db_factory() as db:
-        query = select(Todo)
+        query = select(Todo, TodoList.title).outerjoin(TodoListMember, TodoListMember.todo_id == Todo.id).outerjoin(
+            TodoList, TodoList.id == TodoListMember.list_id,
+        )
         if completed is not None:
             query = query.where(Todo.completed.is_(completed))
         rows = db.execute(
             query.order_by(Todo.completed, Todo.due_at.is_(None), Todo.due_at, Todo.created_at.desc())
             .offset(offset).limit(limit)
-        ).scalars().all()
+        ).all()
         return {"items": [{
             "id": row.id,
             "title": row.title,
+            "list_title": list_title,
             "due_at": _utc_iso(row.due_at) if row.due_at else None,
             "completed": row.completed,
             "created_at": _utc_iso(row.created_at),
-        } for row in rows]}
+        } for row, list_title in rows]}
+
+
+@router.get("/todo-lists")
+def list_todo_lists(request: Request, user: User = Depends(require_user)) -> dict[str, object]:
+    with request.app.state.db_factory() as db:
+        rows = db.execute(select(TodoList).where(TodoList.created_by == user.id).order_by(TodoList.created_at.desc())).scalars().all()
+        return {"items": [{"id": row.id, "title": row.title, "created_at": _utc_iso(row.created_at)} for row in rows]}
+
+
+@router.post("/todo-lists", status_code=201)
+def create_todo_list(body: TodoListCreate, request: Request, user: User = Depends(require_user)) -> dict[str, object]:
+    with request.app.state.db_factory() as db:
+        row = TodoList(title=body.title, created_by=user.id)
+        db.add(row)
+        db.commit()
+        db.refresh(row)
+        result = {"id": row.id, "title": row.title, "created_at": _utc_iso(row.created_at)}
+    _audit(request, user.id, "todo_list.created", {"list_id": result["id"]})
+    return result
+
+
+@router.post("/todo-lists/{list_id}/items", status_code=201)
+def create_list_item(list_id: str, body: TodoCreate, request: Request, user: User = Depends(require_user)) -> dict[str, object]:
+    with request.app.state.db_factory() as db:
+        row = db.get(TodoList, list_id)
+        if row is None or row.created_by != user.id:
+            raise HTTPException(404, "todo list not found")
+        todo = Todo(title=body.title, due_at=body.due_at.astimezone(timezone.utc) if body.due_at else None, created_by=user.id)
+        db.add(todo)
+        db.flush()
+        db.add(TodoListMember(todo_id=todo.id, list_id=list_id))
+        db.commit()
+        result = {"id": todo.id, "title": todo.title, "list_id": list_id, "completed": todo.completed}
+    _audit(request, user.id, "todo.created", {"todo_id": result["id"], "list_id": list_id})
+    return result
 
 
 @router.post("/todos", status_code=201)
@@ -437,6 +479,9 @@ def delete_todo(todo_id: str, request: Request, user: User = Depends(require_use
         todo = db.get(Todo, todo_id)
         if todo is None:
             raise HTTPException(404, "todo not found")
+        member = db.get(TodoListMember, todo_id)
+        if member is not None:
+            db.delete(member)
         db.delete(todo)
         db.commit()
     _audit(request, user.id, "todo.deleted", {"todo_id": todo_id})

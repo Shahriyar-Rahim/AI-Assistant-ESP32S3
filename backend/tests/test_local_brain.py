@@ -130,3 +130,15 @@ def test_schedule_sync_lists_future_items_and_hash_changes():
         session.commit()
     assert schedule_sync.schedule_hash(schedule_sync.build_schedule(db, now)) != before
     assert schedule_sync.sync_message("dev", items)["type"] == "schedule.sync"
+
+
+def test_schedule_sync_preserves_timer_kind():
+    db = factory()
+    now = datetime.now(timezone.utc)
+    with db() as session:
+        session.add(CalendarEvent(title="Timer", kind="timer", start_at=now + timedelta(seconds=30),
+                                  timezone_name="UTC"))
+        session.commit()
+    items = schedule_sync.build_schedule(db, now)
+    assert len(items) == 1
+    assert items[0]["kind"] == "timer"

@@ -156,6 +156,8 @@ def _create_reminder(context: ActionContext, args: BaseModel) -> dict[str, Any]:
     values = ReminderArgs.model_validate(args.model_dump())
     if values.due_at.tzinfo is None or values.due_at.utcoffset() is None:
         raise IntentError("reminder time must include a timezone")
+    if values.due_at <= datetime.now(timezone.utc):
+        raise IntentError("That reminder time is in the past. Please specify a future date and time.")
     try:
         from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -184,6 +186,8 @@ def _create_event(context: ActionContext, args: BaseModel) -> dict[str, Any]:
     values = EventArgs.model_validate(args.model_dump())
     if values.due_at.tzinfo is None or values.due_at.utcoffset() is None:
         raise IntentError("event time must include a timezone")
+    if values.due_at <= datetime.now(timezone.utc):
+        raise IntentError("That event time is in the past. Please specify a future date and time.")
     with context.application.state.db_factory() as db:
         event = CalendarEvent(
             id=str(uuid4()),

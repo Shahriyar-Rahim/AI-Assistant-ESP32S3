@@ -3,10 +3,12 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import re
 import time
 import wave
 from datetime import datetime, timezone
+from pathlib import Path
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from io import BytesIO
 from typing import Any
@@ -21,6 +23,7 @@ from app.models import (
     ProviderConfig,
     Reminder,
     Todo,
+    User,
     VoiceEnrollment,
 )
 from app.services.ai.providers import PROVIDERS, ProviderRequestError, ProviderUnavailable
@@ -35,7 +38,7 @@ from app.services.assistant.actions import (
 )
 from app.services import command_repair, game_history, knowledge, local_brain
 from app.services.speech_text import clean_for_speech
-from app.services.assistant.presenter import go_home_after_reply, route_dashboard_request, run_boot_briefing, run_wake_greeting
+from app.services.assistant.presenter import go_home_after_reply, route_alarm_followup, route_calendar_followup, route_dashboard_request, route_note_followup, route_reminder_followup, route_todo_followup, run_boot_briefing, run_wake_greeting, show_stored_page
 from app.services.assistant.device_games import route_device_game
 from app.services.assistant.setup_commands import route_setup_command
 from app.services.vision import commands as vision_commands
@@ -44,6 +47,7 @@ from app.services.assistant.personalization import (
     learned_instructions,
     record_interaction,
 )
+from app.services.assistant import private_memory
 from app.services.audio.verification import ReplayGuard, verify_command_audio
 from app.services.biometric.anti_spoof import AntiSpoofUnavailable
 from app.services.biometric.speaker import BiometricUnavailable
@@ -123,7 +127,8 @@ async def _ai_fallback(
         model = active.model if active else application.state.settings.ai_model
         system_prompt = active.settings.get("system_prompt", "You are a helpful voice assistant.") if active else "You are a helpful voice assistant."
     provider = PROVIDERS.get(provider_name)
-    if provider is None or not model:
+    ollama_model = getattr(application.state.settings, "ollama_fallback_model", "")
+    if (provider is None or not model) and not ollama_model:
         return "I could not match that request to a safe available action.", None
     action_schemas = ACTION_REGISTRY.schemas()
     personalization = learned_instructions(application.state.db_factory, user_id=user_id)
@@ -135,6 +140,7 @@ async def _ai_fallback(
         '{"kind":"action","name":"<registered action>","arguments":{...}} '
         'or {"kind":"reply","text":"..."}. Never invent action names, credentials, or arguments. '
         f"Registered actions and exact argument schemas: {json.dumps(action_schemas, separators=(',', ':'))}"
+        f" Current UTC date and time: {datetime.now(timezone.utc).isoformat()}."
     )
     messages = [
         {"role": "system", "content": f"{system_prompt}\n{personalization}\n{prompt}\n"
@@ -144,12 +150,19 @@ async def _ai_fallback(
     ]
     fallback_model = getattr(application.state.settings, "ai_fallback_model", "")
     result = None
-    for attempt_model in dict.fromkeys(item for item in (model, fallback_model) if item):
+    attempts = []
+    if provider is not None and model:
+        attempts.extend((provider_name, provider, item) for item in dict.fromkeys(
+            item for item in (model, fallback_model if provider_name == "gemini" else "") if item
+        ))
+    if ollama_model and (provider_name != "ollama" or model != ollama_model):
+        attempts.append(("ollama", PROVIDERS["ollama"], ollama_model))
+    for attempt_provider_name, attempt_provider, attempt_model in attempts:
         try:
-            result = await provider.complete(messages, attempt_model)
+            result = await attempt_provider.complete(messages, attempt_model)
             break
         except (ProviderUnavailable, ProviderRequestError) as exc:
-            logger.warning("Voice AI resolution failed with %s: %s", attempt_model, exc)
+            logger.warning("Voice AI resolution failed with %s/%s: %s", attempt_provider_name, attempt_model, exc)
     if result is None:
         return "The assistant service is not available right now.", None
     try:
@@ -262,7 +275,18 @@ def _device_timezone(application, device_id: str):
         try:
             return ZoneInfo(name)
         except ZoneInfoNotFoundError:
-            pass
+            logger.warning("Device %s has invalid timezone %r; using server timezone", device_id, name)
+    server_zone = os.environ.get("TZ", "").lstrip(":")
+    if not server_zone:
+        try:
+            server_zone = str(Path("/etc/localtime").resolve().relative_to("/usr/share/zoneinfo"))
+        except ValueError:
+            server_zone = ""
+    if server_zone:
+        try:
+            return ZoneInfo(server_zone)
+        except (ValueError, ZoneInfoNotFoundError):
+            logger.warning("Server timezone %r is not a valid IANA timezone", server_zone)
     return datetime.now().astimezone().tzinfo
 
 
@@ -271,14 +295,60 @@ _YES_WORDS = re.compile(r"^(?:yes|yeah|yep|yup|correct|right|that one|do it|sure
 SUGGESTION_SECONDS = 20.0
 
 
+def _volume_number(text: str) -> int | None:
+    if text.isdecimal():
+        return int(text)
+    units = {"zero": 0, "one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6,
+             "seven": 7, "eight": 8, "nine": 9, "ten": 10, "eleven": 11, "twelve": 12,
+             "thirteen": 13, "fourteen": 14, "fifteen": 15, "sixteen": 16, "seventeen": 17,
+             "eighteen": 18, "nineteen": 19}
+    tens = {"twenty": 20, "thirty": 30, "forty": 40, "fifty": 50, "sixty": 60,
+            "seventy": 70, "eighty": 80, "ninety": 90}
+    words = text.replace("-", " ").split()
+    if len(words) == 1:
+        return units.get(words[0], tens.get(words[0]))
+    if len(words) == 2 and words[0] == "one" and words[1] == "hundred":
+        return 100
+    if len(words) == 2 and words[0] in tens and words[1] in units and 1 <= units[words[1]] <= 9:
+        return tens[words[0]] + units[words[1]]
+    return None
+
+
 async def _resolve(application, device_id: str, user_id: str, transcript: str, websocket=None) -> str:
+    if websocket is not None:
+        followup = await route_alarm_followup(application, device_id, user_id, transcript)
+        if followup is not None:
+            if followup.startswith("Okay, alarm set"):
+                from app.services.assistant.presenter import _sync_created_schedule
+                if not await _sync_created_schedule(application, device_id, websocket):
+                    followup += " The device schedule was not sent."
+            await show_stored_page(application, websocket, device_id, "alarms", user_id)
+            return followup
+        followup = await route_calendar_followup(application, device_id, user_id, transcript)
+        if followup is not None:
+            await show_stored_page(application, websocket, device_id, "calendar", user_id)
+            return followup
+        followup = await route_reminder_followup(application, device_id, user_id, transcript)
+        if followup is not None:
+            await show_stored_page(application, websocket, device_id, "reminders", user_id)
+            return followup
+        followup = await route_note_followup(application, device_id, user_id, transcript)
+        if followup is not None:
+            await show_stored_page(application, websocket, device_id, "notes", user_id)
+            return followup
+        followup = await route_todo_followup(application, device_id, user_id, transcript)
+        if followup is not None:
+            await show_stored_page(application, websocket, device_id, "todos", user_id)
+            return followup
     heard = transcript
     pending = application.state.pending_suggestions.pop(device_id, None)
-    if pending is not None and pending[1] > time.monotonic() and _YES_WORDS.match(transcript.casefold().strip()):
+    game_letter = (application.state.device_games.get(device_id)
+                   and re.fullmatch(r"[a-zA-Z][.!?]?", transcript.strip()))
+    if not game_letter and pending is not None and pending[1] > time.monotonic() and _YES_WORDS.match(transcript.casefold().strip()):
         transcript = pending[0]
         await asyncio.to_thread(command_repair.learn_alias, application.state.db_factory, user_id, pending[2], transcript)
         logger.info("Learned that %r means %r", pending[2], transcript)
-    else:
+    elif not game_letter:
         transcript, how = await asyncio.to_thread(command_repair.repair, application.state.db_factory, user_id, heard)
         if how:
             logger.info("Repaired heard command %r -> %r (%s)", heard, transcript, how)
@@ -309,6 +379,32 @@ async def _resolve_command(application, device_id: str, user_id: str, transcript
     if game_reply is not None:
         return game_reply
     lowered = transcript.casefold()
+    volume_request = re.fullmatch(
+        r"\s*(?:set|change)\s+(?:the\s+)?volume\s+(?:to\s+)?(?:level\s+)?([a-z0-9 -]+?)(?:\s*(?:percent|%))?\s*[.!?]*\s*",
+        lowered,
+    )
+    if volume_request:
+        volume = _volume_number(volume_request.group(1).strip())
+        if volume is None or not 0 <= volume <= 100:
+            return "Volume must be between zero and one hundred percent."
+        from fastapi import HTTPException
+        from app.api.devices import set_device_config
+
+        def is_admin() -> bool:
+            with application.state.db_factory() as db:
+                user = db.get(User, user_id)
+                return user is not None and user.active and user.role == "admin"
+
+        if not await asyncio.to_thread(is_admin):
+            return "Only an administrator can change the device volume."
+        try:
+            result = await set_device_config(application, device_id, {"volume": volume}, user_id)
+        except HTTPException as exc:
+            logger.warning("Cannot set volume for %s: %s", device_id, exc.detail)
+            return "I couldn't set the device volume."
+        if result["delivery"] != "sent":
+            return f"I saved volume at {volume} percent. It will apply when the device reconnects."
+        return f"I sent the volume setting of {volume} percent to the device."
     if _is_game_stats_question(lowered):
         return await asyncio.to_thread(
             game_history.spoken_summary, application.state.db_factory, user_id, _mentioned_game(lowered),
@@ -527,6 +623,7 @@ async def process_command_audio(application, websocket, device_id: str, pcm: byt
         return
     settings = application.state.settings
     guard = _REPLAY_GUARDS.setdefault(device_id, ReplayGuard())
+    await _send_json(websocket, device_id, "animation.state", {"state": "thinking"})
     await _send_json(websocket, device_id, "assistant.response", {"state": "verifying"})
     verification = await asyncio.to_thread(
         verify_command_audio,
@@ -565,23 +662,54 @@ async def process_command_audio(application, websocket, device_id: str, pcm: byt
     })
     try:
         transcript, stt_metadata = await _transcribe(application, pcm)
-    except (SpeechServiceError, LocalSpeechUnavailable, ValueError) as exc:
+    except ValueError as exc:
         _audit(application, device_id, "voice.transcription", "failed", {"reason": str(exc)})
         await _send_json(websocket, device_id, "device.error", {
             "code": "stt_unavailable_or_failed",
             "detail": str(exc),
         })
-        await _send_json(websocket, device_id, "animation.state", {"state": "idle"})
+        if application.state.device_games.get(device_id):
+            await _speak(application, websocket, device_id, "I didn't catch that. Please try your guess again.")
+        else:
+            await _send_json(websocket, device_id, "animation.state", {"state": "idle"})
+        return
+    except (SpeechServiceError, LocalSpeechUnavailable) as exc:
+        _audit(application, device_id, "voice.transcription", "failed", {"reason": str(exc)})
+        await _send_json(websocket, device_id, "device.error", {
+            "code": "stt_unavailable_or_failed",
+            "detail": str(exc),
+        })
+        if application.state.device_games.get(device_id):
+            await _speak(application, websocket, device_id, "Speech recognition is unavailable. Please check the server.")
+        else:
+            await _send_json(websocket, device_id, "animation.state", {"state": "idle"})
         return
     wake_phrase = settings.wake_word.strip()
     if wake_phrase and transcript.casefold().startswith(wake_phrase.casefold()):
         transcript = transcript[len(wake_phrase):].lstrip(" ,.!?")
-    if not transcript or _is_noise_transcript(transcript):
+    game_active = bool(application.state.device_games.get(device_id))
+    letter_guess = game_active and bool(re.fullmatch(r"[a-zA-Z][.!?]?", transcript.strip()))
+    pending_list = application.state.pending_todo_lists.get(device_id)
+    pending_note = application.state.pending_notes.get(device_id)
+    pending_reminder = application.state.pending_reminders.get(device_id)
+    pending_alarm = application.state.pending_alarms.get(device_id)
+    pending_event = application.state.pending_calendar_events.get(device_id)
+    pending_confirmation = (
+        (pending_list is not None and pending_list[0] == verification.user_id and pending_list[-1] > time.monotonic())
+        or (pending_note is not None and pending_note[0] == verification.user_id and pending_note[-1] > time.monotonic())
+        or (pending_reminder is not None and pending_reminder[0] == verification.user_id and pending_reminder[-1] > time.monotonic())
+        or (pending_alarm is not None and pending_alarm[0] == verification.user_id and pending_alarm[-1] > time.monotonic())
+        or (pending_event is not None and pending_event[0] == verification.user_id and pending_event[-1] > time.monotonic())
+    ) and bool(re.fullmatch(r"(?:no|ok|okay)[.!?]?", transcript.strip(), re.IGNORECASE))
+    if not transcript or (_is_noise_transcript(transcript) and not letter_guess and not pending_confirmation):
         await _send_json(websocket, device_id, "device.error", {"code": "empty_transcript"})
-        await _send_json(websocket, device_id, "animation.state", {"state": "idle"})
-        go_home_after_reply(application, websocket, device_id, hold=2.0)
+        if game_active:
+            await _speak(application, websocket, device_id, "I didn't catch that. Please try your guess again.")
+        else:
+            await _send_json(websocket, device_id, "animation.state", {"state": "idle"})
+            go_home_after_reply(application, websocket, device_id, hold=2.0)
         return
-    logger.info("Command from %s: %r (game active: %s)", device_id, transcript,
+    logger.info("Command received from %s (game active: %s)", device_id,
                 bool(application.state.device_games.get(device_id)))
     _audit(application, device_id, "voice.transcription", "success", {
         "provider": stt_metadata["provider"],
@@ -609,7 +737,18 @@ async def process_command_audio(application, websocket, device_id: str, pcm: byt
         await _send_json(websocket, device_id, "device.error", {
             "code": "personalization_storage_unavailable",
         })
-    reply = await _resolve(application, device_id, verification.user_id, transcript, websocket)
+    reply = await asyncio.to_thread(
+        private_memory.route, application.state.db_factory, settings, verification.user_id, transcript,
+        verified=verification.reason == "verified",
+    )
+    if reply == "I couldn't find that in your private facts." and verification.reason == "verified":
+        semantic = await private_memory.semantic_recall(
+            application.state.db_factory, settings, verification.user_id, transcript, verified=True,
+        )
+        if semantic is not None:
+            reply = semantic
+    if reply is None:
+        reply = await _resolve(application, device_id, verification.user_id, transcript, websocket)
     application.state.wake_briefings.pop(device_id, None)
     _audit(application, device_id, "voice.response", "success", {"user_id": verification.user_id})
     await _speak(application, websocket, device_id, reply)

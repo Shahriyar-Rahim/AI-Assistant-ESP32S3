@@ -19,6 +19,12 @@ services:
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
       GEMINI_API_KEY: ${GEMINI_API_KEY:-}
       OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-http://127.0.0.1:11434}
+      PRIVATE_MEMORY_MODEL: ${PRIVATE_MEMORY_MODEL:-}
+      PRIVATE_MEMORY_OLLAMA_URL: http://127.0.0.1:11434
+      MEM0_ENABLED: ${MEM0_ENABLED:-false}
+      MEM0_EMBEDDING_MODEL: ${MEM0_EMBEDDING_MODEL:-all-minilm}
+      MEM0_EMBEDDING_DIMENSIONS: ${MEM0_EMBEDDING_DIMENSIONS:-384}
+      MEM0_TELEMETRY: "false"
       VOICE_ENCRYPTION_KEY: ${VOICE_ENCRYPTION_KEY:-}
       BIOMETRIC_THRESHOLD: ${BIOMETRIC_THRESHOLD:-0.75}
       TTS_PROVIDER: ${TTS_PROVIDER:-openai}
@@ -54,6 +60,21 @@ services:
     depends_on:
       backend:
         condition: service_healthy
+  ollama:
+    image: ollama/ollama:0.13.5
+    profiles: ["memory"]
+    network_mode: "service:backend"
+    environment:
+      OLLAMA_HOST: 127.0.0.1:11434
+      OLLAMA_NO_CLOUD: "1"
+      OLLAMA_NUM_PARALLEL: "1"
+      OLLAMA_MAX_LOADED_MODELS: "1"
+    volumes:
+      - ollama_models:/root/.ollama
+    depends_on:
+      backend:
+        condition: service_healthy
 
 volumes:
   assistant_data:
+  ollama_models:

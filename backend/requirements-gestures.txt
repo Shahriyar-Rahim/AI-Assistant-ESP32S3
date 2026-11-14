@@ -1,0 +1,2 @@
+# Optional local hand-gesture recognition. Check MediaPipe's supported Python/platform wheels.
+mediapipe>=0.10.14,<0.11

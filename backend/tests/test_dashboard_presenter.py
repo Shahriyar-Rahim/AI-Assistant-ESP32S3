@@ -4,7 +4,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from app.models import CalendarEvent, Device, Reminder, Todo
+from app.models import CalendarEvent, Device, Note, Reminder, Todo, TodoList, TodoListMember
 from app.services import news as news_service
 from app.services.assistant import orchestrator, presenter
 
@@ -26,7 +26,8 @@ def make_app(device_config=None):
             db.commit()
     settings = SimpleNamespace(boot_briefing=True, wake_weather=True, news_default_country="US")
     return SimpleNamespace(state=SimpleNamespace(
-        db_factory=factory, settings=settings, home_tasks={}, audio_echo_until={}, device_games={},
+        db_factory=factory, settings=settings, home_tasks={}, audio_echo_until={}, device_games={}, devices={},
+        pending_todo_lists={}, pending_notes={}, pending_reminders={}, pending_calendar_events={}, pending_alarms={}, pending_suggestions={}, relisten={},
     ))
 
 
@@ -151,6 +152,187 @@ def test_voice_creation_of_alarm_task_and_reminder(recorder):
         assert db.query(CalendarEvent).filter_by(kind="alarm").count() == 1
         assert db.query(Todo).one().title == "Buy bread"
         assert db.query(Reminder).one().title == "Call mom"
+
+
+def test_alarm_missing_time_prompts_and_accepts_followup(recorder):
+    app = make_app()
+    assert "What time" in run(presenter.route_dashboard_request(app, object(), "dev", "u1", "set an alarm"))
+    assert app.state.relisten["dev"]
+    assert "alarm set" in run(presenter.route_alarm_followup(app, "dev", "u1", "7 AM"))
+    with app.state.db_factory() as db:
+        assert db.query(CalendarEvent).filter_by(kind="alarm").count() == 1
+
+
+def test_voice_timer_is_separate_and_can_be_queried_and_cancelled(recorder):
+    app = make_app()
+    reply = run(presenter.route_dashboard_request(app, object(), "dev", "u1", "set a timer for 5 minutes"))
+    assert "5 minutes" in reply
+    with app.state.db_factory() as db:
+        timer = db.query(CalendarEvent).filter_by(kind="timer").one()
+        assert 290 <= (presenter._aware(timer.start_at) - datetime.now(timezone.utc)).total_seconds() <= 300
+    assert "remaining" in run(presenter.route_dashboard_request(app, object(), "dev", "u1", "how much time is left on my timer"))
+    assert "cancelled" in run(presenter.route_dashboard_request(app, object(), "dev", "u1", "cancel my timer"))
+    with app.state.db_factory() as db:
+        assert db.query(CalendarEvent).filter_by(kind="timer").one().completed
+    assert "no active timers" in run(presenter.route_dashboard_request(app, object(), "dev", "u1", "show my timers"))
+
+
+def test_timer_duration_must_be_valid(recorder):
+    app = make_app()
+    for text in ("set a timer for 0 seconds", "set a timer for 99999999999999999999 hours", "set a timer for 5 bananas"):
+        assert "duration" in run(presenter.route_dashboard_request(app, object(), "dev", "u1", text))
+    with app.state.db_factory() as db:
+        assert db.query(CalendarEvent).filter_by(kind="timer").count() == 0
+
+
+def test_timer_schedule_is_sent_and_multiple_cancellation_is_safe(recorder):
+    app = make_app()
+    app.state.device_capabilities = {"dev": ["local_schedule"]}
+    app.state.schedule_hashes = {}
+
+    class Socket:
+        def __init__(self):
+            self.messages = []
+
+        async def send_json(self, message):
+            self.messages.append(message)
+
+    socket = Socket()
+    reply = run(presenter.route_dashboard_request(app, socket, "dev", "u1", "set a timer for 5 minutes"))
+    assert "delivery is not confirmed" in reply
+    assert socket.messages[-1]["payload"]["items"][0]["kind"] == "timer"
+    run(presenter.route_dashboard_request(app, socket, "dev", "u1", "set a timer for 10 minutes"))
+    assert "multiple active timers" in run(
+        presenter.route_dashboard_request(app, socket, "dev", "u1", "cancel my timer"))
+    with app.state.db_factory() as db:
+        assert db.query(CalendarEvent).filter_by(kind="timer", completed=False).count() == 2
+    assert "no active timers" in run(
+        presenter.route_dashboard_request(app, socket, "dev", "u2", "cancel my timer"))
+
+
+def test_note_and_make_todo_stay_out_of_calendar(recorder):
+    app = make_app()
+    assert "What would you like" in run(presenter.route_dashboard_request(app, object(), "dev", "u1", "take a note"))
+    assert run(presenter.route_note_followup(app, "dev", "u1", "Bring the red book")) == "I saved your note."
+    assert run(presenter.route_dashboard_request(app, object(), "dev", "u1", "take a note that Buy Milk")) == (
+        "I saved your note."
+    )
+    assert "Would you like" in run(presenter.route_dashboard_request(app, object(), "dev", "u1", "make a to-do for shopping list"))
+    assert "What would you like" in run(presenter.route_todo_followup(app, "dev", "u1", "yes"))
+    assert "Added Milk" in run(presenter.route_todo_followup(app, "dev", "u1", "Milk"))
+    assert "What would you like" in run(presenter.route_todo_followup(app, "dev", "u1", "yes"))
+    assert "Added Bread" in run(presenter.route_todo_followup(app, "dev", "u1", "add Bread"))
+    assert "saved" in run(presenter.route_todo_followup(app, "dev", "u1", "no"))
+    with app.state.db_factory() as db:
+        assert {note.body for note in db.query(Note).all()} == {"Buy Milk", "Bring the red book"}
+        assert db.query(TodoList).one().title == "shopping list"
+        assert {t.title for t in db.query(Todo).all()} == {"Milk", "Bread"}
+        assert db.query(TodoListMember).count() == 2
+        assert db.query(CalendarEvent).count() == 0
+        assert db.query(Reminder).count() == 0
+
+
+def test_reminder_creation_and_followup_use_current_local_tomorrow(recorder, monkeypatch):
+    from zoneinfo import ZoneInfo
+
+    zone = ZoneInfo("Asia/Dhaka")
+    app = make_app()
+    monkeypatch.setattr(orchestrator, "_device_timezone", lambda *_args: zone)
+    assert "What time" in run(orchestrator._resolve(
+        app, "dev", "u1", "make a reminder to call mom tomorrow", object()
+    ))
+    reply = run(orchestrator._resolve(app, "dev", "u1", "at 7 am", object()))
+    assert "tomorrow" in reply
+    assert [payload["page"] for kind, payload in recorder["sent"] if kind == "display.state"] == [
+        "reminders", "reminders",
+    ]
+    with app.state.db_factory() as db:
+        reminder = db.query(Reminder).one()
+        stored = reminder.due_at.replace(tzinfo=timezone.utc) if reminder.due_at.tzinfo is None else reminder.due_at
+        local = stored.astimezone(zone)
+        assert local.date() == datetime.now(zone).date() + timedelta(days=1)
+        assert (local.hour, local.minute) == (7, 0)
+        assert reminder.title == "Call mom"
+        assert db.query(CalendarEvent).count() == 0
+        assert db.query(Todo).count() == 0
+
+
+def test_past_ai_action_is_rejected_without_writing(recorder):
+    from app.services.assistant.actions import ActionContext, IntentError, execute_action
+
+    app = make_app()
+    with pytest.raises(IntentError, match="past"):
+        run(execute_action(ActionContext(app, "dev", "u1"), "reminder.create", {
+            "title": "Call", "due_at": "2025-05-15T09:00:00+00:00",
+        }))
+    with app.state.db_factory() as db:
+        assert db.query(Reminder).count() == 0
+
+
+def test_half_hour_is_not_silently_truncated():
+    now = datetime(2031, 1, 1, 9, tzinfo=timezone.utc)
+    assert presenter._parse_time("in one and a half hours", timezone.utc, now) == now + timedelta(minutes=90)
+
+
+def test_calendar_followup_is_separate_and_uses_live_tomorrow(recorder, monkeypatch):
+    from zoneinfo import ZoneInfo
+
+    zone = ZoneInfo("Asia/Dhaka")
+    app = make_app()
+    monkeypatch.setattr(orchestrator, "_device_timezone", lambda *_args: zone)
+    assert "What time" in run(orchestrator._resolve(
+        app, "dev", "u1", "schedule a meeting called Dentist tomorrow", object()
+    ))
+    reply = run(orchestrator._resolve(app, "dev", "u1", "at 7 am", object()))
+    assert "calendar" in reply and "tomorrow" in reply
+    with app.state.db_factory() as db:
+        event = db.query(CalendarEvent).one()
+        stored = event.start_at.replace(tzinfo=timezone.utc) if event.start_at.tzinfo is None else event.start_at
+        local = stored.astimezone(zone)
+        assert local.date() == datetime.now(zone).date() + timedelta(days=1)
+        assert (local.hour, local.minute, event.title, event.kind) == (7, 0, "Dentist", "event")
+        assert db.query(Reminder).count() == db.query(Todo).count() == db.query(Note).count() == 0
+    assert all(payload["page"] == "calendar" for kind, payload in recorder["sent"] if kind == "display.state")
+
+
+def test_alarm_unsupported_date_is_not_silently_rescheduled(recorder):
+    app = make_app()
+    reply = run(presenter.route_dashboard_request(app, object(), "dev", "u1", "set an alarm next monday at 7 am"))
+    assert "today, tomorrow" in reply
+    with app.state.db_factory() as db:
+        assert db.query(CalendarEvent).count() == 0
+
+
+def test_notes_display_is_scoped_to_owner(recorder):
+    app = make_app()
+    with app.state.db_factory() as db:
+        db.add_all([Note(body="Owner note", created_by="u1"), Note(body="Other note", created_by="u2")])
+        db.commit()
+    reply = run(presenter.route_dashboard_request(app, object(), "dev", "u1", "show my notes"))
+    assert "Owner note" in reply and "Other note" not in reply
+    payload = next(payload for kind, payload in recorder["sent"] if kind == "display.state")
+    assert payload["page"] == "notes" and payload["items"] == ["Owner note"]
+    assert payload["counts"]["notes"] == 1
+
+
+def test_tomorrow_uses_live_year():
+    from zoneinfo import ZoneInfo
+
+    zone = ZoneInfo("Asia/Dhaka")
+    now = datetime(2031, 12, 31, 18, 30, tzinfo=timezone.utc)
+    result = presenter._parse_time("tomorrow at 7 am", zone, now)
+    assert result is not None
+    assert result.astimezone(zone).isoformat() == "2032-01-02T07:00:00+06:00"
+
+
+def test_list_followup_is_user_scoped_and_home_cancels(recorder):
+    app = make_app()
+    run(presenter.route_dashboard_request(app, object(), "dev", "u1", "make a to-do for shopping"))
+    assert run(presenter.route_todo_followup(app, "dev", "u2", "yes")) is None
+    assert "What would" in run(presenter.route_todo_followup(app, "dev", "u1", "yes"))
+    assert run(presenter.route_todo_followup(app, "dev", "u1", "go home")) is None
+    with app.state.db_factory() as db:
+        assert db.query(Todo).count() == 0
 
 
 def test_news_parsing():

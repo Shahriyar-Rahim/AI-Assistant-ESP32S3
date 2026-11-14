@@ -21,6 +21,7 @@ QueueHandle_t pcm_queue = nullptr;
 QueueHandle_t playback_queue = nullptr;
 std::atomic_bool capture_enabled{true};
 std::atomic_bool startup_sound_active{false};
+std::atomic<unsigned> playback_volume{100};
 constexpr UBaseType_t CAPTURE_QUEUE_BLOCKS = 100;
 constexpr UBaseType_t PLAYBACK_QUEUE_BLOCKS = 250;
 constexpr TickType_t AMPLIFIER_IDLE_TIMEOUT = pdMS_TO_TICKS(600);
@@ -154,6 +155,13 @@ void playback_task(void*) {
                 vTaskDelay(pdMS_TO_TICKS(10));
             }
         }
+        const unsigned volume = playback_volume.load();
+        if (volume != 100) {
+            for (size_t i = 0; i < block.sample_count; ++i) {
+                block.samples[i] = static_cast<int16_t>(
+                    static_cast<int32_t>(block.samples[i]) * static_cast<int32_t>(volume) / 100);
+            }
+        }
         size_t bytes_written = 0;
         const esp_err_t result = i2s_channel_write(
             tx_channel, block.samples,
@@ -171,6 +179,12 @@ void playback_task(void*) {
 }
 
 namespace AudioI2S {
+
+esp_err_t set_volume(unsigned percent) {
+    if (percent > 100) return ESP_ERR_INVALID_ARG;
+    playback_volume.store(percent);
+    return ESP_OK;
+}
 
 esp_err_t initialize() {
     gpio_config_t amp_enable = {

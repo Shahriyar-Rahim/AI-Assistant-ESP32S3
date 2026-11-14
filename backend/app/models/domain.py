@@ -90,6 +90,22 @@ class Todo(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
 
 
+class TodoList(Base):
+    __tablename__ = "todo_lists"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid4()))
+    title: Mapped[str] = mapped_column(String(200), nullable=False)
+    created_by: Mapped[str | None] = mapped_column(ForeignKey("users.id"))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
+
+
+class TodoListMember(Base):
+    __tablename__ = "todo_list_members"
+
+    todo_id: Mapped[str] = mapped_column(ForeignKey("todos.id", ondelete="CASCADE"), primary_key=True)
+    list_id: Mapped[str] = mapped_column(ForeignKey("todo_lists.id", ondelete="CASCADE"), nullable=False, index=True)
+
+
 class GameSession(Base):
     __tablename__ = "game_sessions"
     __table_args__ = (Index("ix_game_sessions_user_game", "user_id", "game", "updated_at"),)

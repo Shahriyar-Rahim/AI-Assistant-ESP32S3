@@ -28,7 +28,10 @@ namespace
         Number,
         Trivia,
         Hangman,
-        Word
+        Word,
+        Dice,
+        Roulette,
+        Symbols
     };
 
     struct GameInfo
@@ -46,6 +49,9 @@ namespace
         {Game::Trivia, "trivia", "TRIVIA", "trivia"},
         {Game::Hangman, "hangman", "HANGMAN", "hangman"},
         {Game::Word, "word_association", "WORD ASSOCIATION", "word association"},
+        {Game::Dice, "dice", "DICE", "dice"},
+        {Game::Roulette, "roulette", "ROULETTE", "roulette"},
+        {Game::Symbols, "symbols", "DECISION SYMBOLS", "symbols"},
     };
     constexpr size_t GAME_COUNT = sizeof(GAMES) / sizeof(GAMES[0]);
 
@@ -515,6 +521,39 @@ namespace
         const esp_err_t result = DeviceDisplay::set_game_view(view);
         if (result != ESP_OK)
             ESP_LOGW(TAG, "Cannot render game view: %s", esp_err_to_name(result));
+    }
+
+    void utility_turn(DeviceGames::Reply &reply)
+    {
+        DeviceDisplay::GameView view;
+        if (current == Game::Dice)
+        {
+            const unsigned value = random_below(6) + 1;
+            std::snprintf(view.title, sizeof(view.title), "DICE");
+            std::snprintf(view.status, sizeof(view.status), "ROLLED %u", value);
+            say(reply, "I rolled a %u. Say roll again or stop.", value);
+        }
+        else if (current == Game::Roulette)
+        {
+            const unsigned value = random_below(37);
+            const bool red = value != 0 &&
+                             ((value <= 10 || (value >= 19 && value <= 28)) ? value % 2 == 1 : value % 2 == 0);
+            const char *color = value == 0 ? "green" : red ? "red" : "black";
+            std::snprintf(view.title, sizeof(view.title), "ROULETTE");
+            std::snprintf(view.status, sizeof(view.status), "%u %s", value, color);
+            say(reply, "The wheel landed on %u, %s. Say spin again or stop.", value, color);
+        }
+        else
+        {
+            static constexpr const char *symbols[] = {"sun", "moon", "star", "heart", "circle", "triangle"};
+            const char *symbol = symbols[random_below(sizeof(symbols) / sizeof(symbols[0]))];
+            std::snprintf(view.title, sizeof(view.title), "DECISION SYMBOLS");
+            std::snprintf(view.status, sizeof(view.status), "%s", symbol);
+            say(reply, "The symbol is %s. Say choose again or stop.", symbol);
+        }
+        std::snprintf(view.line1, sizeof(view.line1), "AGAIN OR STOP");
+        show(view);
+        reply.sound = "move";
     }
 
     void wrap_rows(DeviceDisplay::GameView &view, const char *text, size_t width)
@@ -1263,7 +1302,7 @@ namespace
             return;
         }
         hangman_render();
-        say(reply, "No, %c is not in the word. %d of %d misses.", letter, hangman_mistakes, HANGMAN_MAX);
+        say(reply, "No, %c is not in the word. %d of %d misses. Try another letter.", letter, hangman_mistakes, HANGMAN_MAX);
     }
 
     // ---------- Word association ----------
@@ -1409,6 +1448,10 @@ namespace
         case Game::Word:
             conclude("abandoned", word_hits, WORD_TARGET, word_turns);
             break;
+        case Game::Dice:
+        case Game::Roulette:
+        case Game::Symbols:
+            break;
         case Game::None:
             break;
         }
@@ -1452,11 +1495,11 @@ namespace DeviceGames
         reset_reply(reply);
         reply.handled = true;
         DeviceDisplay::clear_game_view();
-        const char *items[] = {"TIC TAC TOE  HANGMAN", "ROCK PAPER SCISSORS", "NUMBER GUESSING TRIVIA", "WORD ASSOCIATION"};
-        DeviceDisplay::set_dashboard("games", "GAMES", "SAY PLAY AND A NAME", items, 4, 0, 0, 0, 0, 0);
+        const char *items[] = {"TIC TAC TOE  HANGMAN", "ROCK PAPER SCISSORS", "NUMBER GUESSING TRIVIA", "WORD ASSOCIATION", "DICE ROULETTE SYMBOLS"};
+        DeviceDisplay::set_dashboard("games", "GAMES", "SAY PLAY AND A NAME", items, 5, 0, 0, 0, 0, 0);
         say(reply,
-            "I have six games on my own processor: tic tac toe, rock paper scissors, number guessing, trivia, hangman, "
-            "and word association. Say play and a game name, or say pick a game and I will choose one.");
+            "I have tic tac toe, rock paper scissors, number guessing, trivia, hangman, word association, "
+            "dice, roulette, and decision symbols. Say play and a name.");
         reply.sound = "notification";
         finish_reply(reply);
     }
@@ -1502,6 +1545,12 @@ namespace DeviceGames
             break;
         case Game::Word:
             word_start(reply);
+            break;
+        case Game::Dice:
+        case Game::Roulette:
+        case Game::Symbols:
+            finished = false;
+            utility_turn(reply);
             break;
         case Game::None:
             break;
@@ -1571,6 +1620,14 @@ namespace DeviceGames
             break;
         case Game::Word:
             word_input(normalized, reply);
+            break;
+        case Game::Dice:
+        case Game::Roulette:
+        case Game::Symbols:
+            if (wants_restart(normalized) || has_any(normalized, {"roll", "spin", "choose", "pick", "draw"}))
+                utility_turn(reply);
+            else
+                reply.handled = false;
             break;
         case Game::None:
             reply.handled = false;

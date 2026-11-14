@@ -28,6 +28,27 @@ def make_client(tmp_path):
     return client
 
 
+def test_vision_merge_requires_auth_and_preserves_identity_data(tmp_path) -> None:
+    import numpy as np
+
+    from app.services.vision import store
+
+    with make_client(tmp_path) as client:
+        factory = client.app.state.db_factory
+        vector = np.ones(128, dtype=np.float32)
+        source = store.create_identity(factory, None, "Unknown 2", "stranger", vector)
+        target = store.create_identity(factory, None, "Owner", "owner", vector)
+        store.log_event(factory, None, "new_face", "Seen", source)
+        headers = {"Authorization": ""}
+        assert client.post(f"/api/v1/vision/people/{source}/merge", json={"target_id": target}, headers=headers).status_code == 401
+        assert client.post(f"/api/v1/vision/people/{source}/merge", json={"target_id": source}).status_code == 409
+        result = client.post(f"/api/v1/vision/people/{source}/merge", json={"target_id": target})
+        assert result.status_code == 200 and result.json() == {"merged": True, "target_id": target}
+        assert {person["id"] for person in client.get("/api/v1/vision/people").json()} == {target}
+        assert len(store.load_embeddings(factory)) == 2
+        assert store.recent_events(factory)[0]["identity_id"] == target
+
+
 def test_calendar_reminder_notes_and_audit_exports(tmp_path) -> None:
     with make_client(tmp_path) as client:
         event = client.post("/api/v1/calendar/events", json={
@@ -72,6 +93,45 @@ def test_calendar_reminder_notes_and_audit_exports(tmp_path) -> None:
         assert client.get("/api/v1/audit").json()["total"] >= 5
         assert "event_type" in client.get("/api/v1/audit/export.csv").text
         assert client.get("/api/v1/audit/export.json").json()
+
+
+def test_named_todo_list_items_persist_and_complete(tmp_path) -> None:
+    with make_client(tmp_path) as client:
+        created = client.post("/api/v1/todo-lists", json={"title": "Shopping list"})
+        assert created.status_code == 201
+        list_id = created.json()["id"]
+        added = client.post(f"/api/v1/todo-lists/{list_id}/items", json={"title": "Milk"})
+        assert added.status_code == 201
+        todo_id = added.json()["id"]
+        assert client.get("/api/v1/todo-lists").json()["items"][0]["id"] == list_id
+        item = next(item for item in client.get("/api/v1/todos").json()["items"] if item["id"] == todo_id)
+        assert item["list_title"] == "Shopping list"
+        assert client.patch(f"/api/v1/todos/{todo_id}", json={"completed": True}).json()["completed"]
+        assert client.delete(f"/api/v1/todos/{todo_id}").status_code == 204
+        assert client.post("/api/v1/todo-lists/missing/items", json={"title": "Bread"}).status_code == 404
+
+
+def test_device_volume_is_validated_stored_and_sent(tmp_path) -> None:
+    with make_client(tmp_path) as client:
+        registered = client.post("/api/v1/devices/register", json={"device_id": "volume-test", "name": "Volume"})
+        token = registered.json()["device_token"]
+        for invalid in (-1, 101, True, 12.5):
+            assert client.patch("/api/v1/devices/volume-test/config", json={"volume": invalid}).status_code == 422
+        response = client.patch("/api/v1/devices/volume-test/config", json={"volume": 45})
+        assert response.json()["delivery"] == "stored_until_reconnect"
+        with client.websocket_connect("/api/v1/ws/devices/volume-test/audio",
+                                      headers={"Authorization": f"Bearer {token}"}) as websocket:
+            websocket.send_json({
+                "protocol_version": 1, "message_id": "hello", "device_id": "volume-test",
+                "timestamp": "2026-01-01T00:00:00Z", "type": "device.hello", "payload": {},
+            })
+            assert websocket.receive_json()["payload"]["config"]["volume"] == 45
+            websocket.receive_json()
+            response = client.patch("/api/v1/devices/volume-test/config", json={"volume": 70})
+            assert response.json()["delivery"] == "sent"
+            message = websocket.receive_json()
+            assert message["type"] == "device.status"
+            assert message["payload"]["volume"] == 70
 
 
 def test_authoritative_games_and_version_conflict(tmp_path) -> None:

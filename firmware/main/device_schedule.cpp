@@ -73,7 +73,8 @@ namespace
     // Passed by value to avoid dangling references during long vTaskDelays
     void show_alert(Item item)
     {
-        const char *heading = std::strcmp(item.kind, "alarm") == 0 ? "ALARM" : "REMINDER";
+        const char *heading = std::strcmp(item.kind, "alarm") == 0 ? "ALARM" :
+                              std::strcmp(item.kind, "timer") == 0 ? "TIMER" : "REMINDER";
         const char *items[] = {item.title};
         DeviceDisplay::set_dashboard("notifications", heading, item.title, items, 1, 0, 0, 0, 1, 0, nullptr);
         for (int repeat = 0; repeat < ALERT_REPEATS; ++repeat)
@@ -97,12 +98,14 @@ namespace
             bool has_due = false;
             if (xSemaphoreTake(store_lock, pdMS_TO_TICKS(100)) == pdTRUE)
             {
+                bool changed = false;
                 for (uint32_t index = 0; index < store.count; ++index)
                 {
                     Item &item = store.items[index];
                     if (item.fired || item.at > now)
                         continue;
                     item.fired = 1;
+                    changed = true;
                     if (now - item.at > MAX_LATE_SECONDS)
                     {
                         item.reported = 1; // Missed while powered off; suppress alert
@@ -112,7 +115,7 @@ namespace
                     has_due = true;
                     break;
                 }
-                if (has_due)
+                if (changed)
                     persist_locked();
                 xSemaphoreGive(store_lock);
             }
@@ -235,7 +238,11 @@ namespace DeviceSchedule
                 if (std::strcmp(next.items[index].id, store.items[old].id) == 0)
                     present = true;
             }
-            if (!present && store.items[old].fired && !store.items[old].reported)
+            const int64_t now = static_cast<int64_t>(time(nullptr));
+            const bool due_pending = !store.items[old].fired && now >= VALID_TIME_FLOOR &&
+                                     store.items[old].at <= now &&
+                                     now - store.items[old].at <= MAX_LATE_SECONDS;
+            if (!present && ((store.items[old].fired && !store.items[old].reported) || due_pending))
             {
                 next.items[next.count++] = store.items[old];
             }

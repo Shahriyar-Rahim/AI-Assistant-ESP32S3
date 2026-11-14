@@ -102,6 +102,41 @@ def test_firmware_boot_hello_triggers_one_boot_greeting(tmp_path, monkeypatch) -
             assert greeted.wait(timeout=1)
 
 
+def test_physical_hello_restores_active_game_after_reconnect(tmp_path) -> None:
+    settings = Settings(
+        database_url=f"sqlite:///{tmp_path / 'reconnect-game.db'}",
+        device_token="device-test",
+        simulator_token="sim-test",
+        allowed_origins=(),
+        max_audio_frame_bytes=4096,
+        vad_rms_threshold=450,
+        vad_end_silence_ms=900,
+        auth_signing_secret="test-signing-secret-that-is-long-enough",
+        bootstrap_admin_username="admin",
+        bootstrap_admin_password="test-password-that-is-long",
+    )
+    app = create_app(settings)
+    with TestClient(app) as client:
+        def connect(active):
+            with client.websocket_connect(
+                "/api/v1/ws/devices/esp32/audio",
+                headers={"Authorization": "Bearer device-test"},
+            ) as websocket:
+                websocket.send_json({
+                    "protocol_version": 1,
+                    "message_id": "boot-reconnect",
+                    "device_id": "esp32",
+                    "timestamp": "2026-01-01T00:00:00Z",
+                    "type": "device.hello",
+                    "payload": {"game_active": active},
+                })
+                assert websocket.receive_json()["type"] == "device.status"
+                assert bool(app.state.device_games.get("esp32")) is active
+
+        connect(True)
+        connect(False)
+
+
 def test_missing_wake_word_model_keeps_audio_stream_available(tmp_path) -> None:
     settings = Settings(
         database_url=f"sqlite:///{tmp_path / 'missing-wake-model.db'}",

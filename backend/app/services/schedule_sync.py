@@ -53,7 +53,7 @@ def build_schedule(db_factory, now: datetime | None = None) -> list[dict[str, ob
             for at in _occurrences(reminder.due_at, reminder.recurrence_rule, reminder.timezone_name, now, horizon):
                 items.append(_entry("r", reminder.id, reminder.title, "reminder", at))
         for event in db.execute(select(CalendarEvent).where(CalendarEvent.completed.is_(False))).scalars():
-            kind = "alarm" if event.kind == "alarm" else "event"
+            kind = event.kind if event.kind in {"alarm", "timer"} else "event"
             for at in _occurrences(event.start_at, event.recurrence_rule, event.timezone_name, now, horizon):
                 items.append(_entry("e", event.id, event.title, kind, at))
     items.sort(key=lambda item: item["at"])

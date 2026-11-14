@@ -842,6 +842,19 @@ namespace
         {
             ESP_LOGE(TAG, "Cannot read stored microphone setting: %s", esp_err_to_name(result));
         }
+        result = nvs_get_u8(handle, "volume", &stored);
+        if (result == ESP_OK && stored <= 100)
+        {
+            AudioI2S::set_volume(stored);
+        }
+        else if (result == ESP_OK)
+        {
+            ESP_LOGW(TAG, "Ignoring invalid stored volume setting");
+        }
+        else if (result != ESP_ERR_NVS_NOT_FOUND)
+        {
+            ESP_LOGE(TAG, "Cannot read stored volume setting: %s", esp_err_to_name(result));
+        }
         nvs_close(handle);
     }
 
@@ -1490,6 +1503,7 @@ o.textContent=await r.text();}
         cJSON_AddStringToObject(root, "type", "device.hello");
         cJSON_AddStringToObject(payload, "firmware_version", firmware_version);
         cJSON_AddBoolToObject(payload, "simulated", false);
+        cJSON_AddBoolToObject(payload, "game_active", DeviceGames::active());
         cJSON_AddStringToObject(location, "country", current_config.country.data());
         cJSON_AddStringToObject(location, "timezone", current_config.timezone.data());
         cJSON_AddStringToObject(location, "city", current_config.city.data());
@@ -1578,14 +1592,17 @@ o.textContent=await r.text();}
             const auto &error = event->error_handle;
             ESP_LOGE(
                 TAG,
-                "WebSocket transport error: %.*s; type=%d close_code=%d handshake_status=%d "
-                "tls_error=%d tls_stack_error=%d tls_flags=%d socket_errno=%d",
+                "WebSocket transport error: %.*s; type=%d close_code=%d handshake_status=%d",
                 event->data_ptr == nullptr ? 0 : event->data_len,
                 event->data_ptr == nullptr ? "" : event->data_ptr,
                 static_cast<int>(error.error_type), event->close_status_code,
-                error.esp_ws_handshake_status_code, error.esp_tls_last_esp_err,
-                error.esp_tls_stack_err, error.esp_tls_cert_verify_flags,
-                error.esp_transport_sock_errno);
+                error.esp_ws_handshake_status_code);
+            if (error.error_type == WEBSOCKET_ERROR_TYPE_TCP_TRANSPORT)
+            {
+                ESP_LOGE(TAG, "WebSocket TCP details: tls_error=%d tls_stack_error=%d tls_flags=%d socket_errno=%d",
+                         error.esp_tls_last_esp_err, error.esp_tls_stack_err,
+                         error.esp_tls_cert_verify_flags, error.esp_transport_sock_errno);
+            }
             xEventGroupClearBits(websocket_events, WEBSOCKET_READY_BIT);
             return;
         }
@@ -1921,6 +1938,16 @@ o.textContent=await r.text();}
                     values = nested_config;
                 const cJSON *brightness = cJSON_GetObjectItemCaseSensitive(values, "brightness");
                 const cJSON *microphone = cJSON_GetObjectItemCaseSensitive(values, "microphone_enabled");
+                const cJSON *volume = cJSON_GetObjectItemCaseSensitive(values, "volume");
+                if (cJSON_IsNumber(volume) && volume->valuedouble >= 0 && volume->valuedouble <= 100 &&
+                    volume->valuedouble == volume->valueint)
+                {
+                    const esp_err_t applied = AudioI2S::set_volume(static_cast<unsigned>(volume->valueint));
+                    const esp_err_t saved = applied == ESP_OK
+                        ? persist_runtime_setting("volume", static_cast<uint8_t>(volume->valueint)) : applied;
+                    if (saved != ESP_OK)
+                        ESP_LOGE(TAG, "Cannot apply or persist volume: %s", esp_err_to_name(saved));
+                }
                 if (cJSON_IsNumber(brightness) && brightness->valueint >= 0 && brightness->valueint <= 100)
                 {
                     const int next = brightness->valueint;

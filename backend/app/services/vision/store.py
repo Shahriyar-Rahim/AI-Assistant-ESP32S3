@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 
 import numpy as np
-from sqlalchemy import delete, func, select
+from sqlalchemy import delete, func, select, update
 
 from app.models import FaceEmbedding, FaceIdentity, User, VisionEvent, VisionMemory
 
@@ -99,6 +99,29 @@ def delete_identity(db_factory, identity_id: str) -> bool:
         db.delete(row)
         db.commit()
         return True
+
+
+def merge_identities(db_factory, source_id: str, target_id: str) -> None:
+    if source_id == target_id:
+        raise ValueError("Choose two different people.")
+    with db_factory() as db:
+        source = db.get(FaceIdentity, source_id)
+        target = db.get(FaceIdentity, target_id)
+        if source is None or target is None:
+            raise ValueError("One of the selected people no longer exists.")
+        if source.user_id != target.user_id:
+            raise ValueError("People belonging to different users cannot be merged.")
+        db.execute(update(FaceEmbedding).where(FaceEmbedding.identity_id == source_id).values(identity_id=target_id))
+        db.execute(update(VisionEvent).where(VisionEvent.identity_id == source_id).values(identity_id=target_id))
+        target.sightings += source.sightings
+        if source.last_seen_at is not None:
+            def utc(value: datetime) -> datetime:
+                return value.replace(tzinfo=timezone.utc) if value.tzinfo is None else value.astimezone(timezone.utc)
+
+            if target.last_seen_at is None or utc(source.last_seen_at) > utc(target.last_seen_at):
+                target.last_seen_at = source.last_seen_at
+        db.delete(source)
+        db.commit()
 
 
 def log_event(db_factory, user_id: str | None, kind: str, detail: str = "", identity_id: str | None = None,

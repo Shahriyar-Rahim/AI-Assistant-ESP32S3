@@ -3,6 +3,7 @@ import time
 from types import SimpleNamespace
 
 import numpy as np
+import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
@@ -44,7 +45,8 @@ def make_monitor(tmp_path):
     settings = SimpleNamespace(
         telegram_bot_token="t", telegram_chat_id="c", vision_dir=str(tmp_path), camera_source="local", camera_index=0,
         camera_interval_seconds=0.7, camera_owner_grace_seconds=45.0, camera_away_record_after_seconds=60.0,
-        camera_segment_seconds=300, camera_enabled=False, camera_low_memory=True)
+        camera_segment_seconds=300, camera_enabled=False, camera_low_memory=True,
+        gesture_enabled=False, gesture_model_path="")
     app = SimpleNamespace(state=SimpleNamespace(settings=settings, db_factory=factory, device_sockets={}))
     monitor = VisionMonitor(app)
     monitor.telegram = FakeTelegram()
@@ -76,6 +78,164 @@ def test_gallery_matches_and_is_unbounded():
     assert gallery.match(vec(9999))[0] is None
     gallery.remove("p7")
     assert gallery.match(vec(7))[0] is None and gallery.count() == 299
+
+
+def test_merge_keeps_embeddings_events_and_rejects_invalid_targets(tmp_path):
+    monitor, factory = make_monitor(tmp_path)
+    owner = store.create_identity(factory, None, "Owner", "owner", vec(1))
+    duplicate = store.create_identity(factory, None, "Unknown 2", "stranger", vec(2))
+    store.add_embedding(factory, duplicate, vec(3))
+    store.log_event(factory, None, "new_face", "Unknown seen", duplicate)
+    with pytest.raises(ValueError):
+        store.merge_identities(factory, duplicate, duplicate)
+    with pytest.raises(ValueError):
+        store.merge_identities(factory, duplicate, "missing")
+    store.merge_identities(factory, duplicate, owner)
+    asyncio.run(monitor.reload())
+    assert set(monitor.people) == {owner}
+    assert monitor.people[owner]["role"] == "owner"
+    assert monitor.people[owner]["sightings"] == 2
+    assert monitor.people[owner]["embeddings"] == 3
+    assert monitor.gallery.match(vec(2))[0] == owner
+    assert monitor.gallery.match(vec(3))[0] == owner
+    assert store.recent_events(factory)[0]["identity_id"] == owner
+
+
+def test_enrollment_does_not_delete_unknown_identity(tmp_path):
+    monitor, factory = make_monitor(tmp_path)
+    unknown = store.create_identity(factory, None, "Unknown 2", "stranger", vec(1))
+    asyncio.run(monitor.reload())
+
+    async def capture(settle=False):
+        return FRAME
+
+    monitor.capture = capture
+    monitor.engine.faces = lambda frame: [(np.zeros(1), vec(1))]
+    asyncio.run(monitor.enroll("Owner", "owner", samples=1))
+    assert unknown in store.identities(factory)
+    assert len(store.identities(factory)) == 2
+
+
+def test_voice_enrollment_tracks_and_reports_success(tmp_path, monkeypatch):
+    from app.services.vision import monitor as monitor_module
+
+    monkeypatch.setattr(monitor_module, "VOICE_ENROLL_SECONDS", 0.12)
+    monkeypatch.setattr(monitor_module, "VOICE_ENROLL_INTERVAL", 0.01)
+    monitor, factory = make_monitor(tmp_path)
+
+    async def grab():
+        return FRAME
+
+    monitor.grab = grab
+    monitor.engine.faces = lambda frame: [(np.zeros(1), vec(1))]
+
+    async def scenario():
+        monitor.start_voice_enrollment("Owner")
+        assert monitor.status()["face_enrollment"] == "tracking"
+        with pytest.raises(monitor_module.VisionError):
+            monitor.start_voice_enrollment("Other")
+        with pytest.raises(monitor_module.VisionError):
+            await monitor.enroll("Other", "known")
+        await monitor._enrollment_task
+
+    asyncio.run(scenario())
+    assert monitor.status()["face_enrollment"] == "completed"
+    assert len(store.load_embeddings(factory)) >= 3
+    assert any("saved your face samples" in text for text in monitor.spoken)
+
+
+def test_voice_enrollment_fails_without_consistent_single_face(tmp_path, monkeypatch):
+    from app.services.vision import monitor as monitor_module
+
+    monkeypatch.setattr(monitor_module, "VOICE_ENROLL_SECONDS", 0.06)
+    monkeypatch.setattr(monitor_module, "VOICE_ENROLL_INTERVAL", 0.01)
+    monitor, factory = make_monitor(tmp_path)
+
+    async def grab():
+        return FRAME
+
+    monitor.grab = grab
+    monitor.engine.faces = lambda frame: [(np.zeros(1), vec(1)), (np.zeros(1), vec(2))]
+
+    async def scenario():
+        monitor.start_voice_enrollment("Owner")
+        await monitor._enrollment_task
+
+    asyncio.run(scenario())
+    assert monitor.status()["face_enrollment"] == "failed"
+    assert store.identities(factory) == {}
+    assert any("couldn't collect enough" in text for text in monitor.spoken)
+
+
+def test_voice_enrollment_window_is_sixty_seconds(tmp_path, monkeypatch):
+    from app.services.vision import monitor as monitor_module
+
+    monitor, factory = make_monitor(tmp_path)
+    clock = [0.0]
+    original_asyncio = asyncio
+
+    async def advance(seconds):
+        clock[0] += seconds
+        await original_asyncio.sleep(0)
+
+    monkeypatch.setattr(monitor_module, "time", SimpleNamespace(monotonic=lambda: clock[0]))
+    monkeypatch.setattr(monitor_module, "asyncio", SimpleNamespace(
+        sleep=advance, to_thread=original_asyncio.to_thread, create_task=original_asyncio.create_task,
+        CancelledError=original_asyncio.CancelledError,
+    ))
+
+    async def grab():
+        return FRAME
+
+    monitor.grab = grab
+    monitor.engine.faces = lambda frame: [(np.zeros(1), vec(1))]
+
+    async def scenario():
+        monitor.start_voice_enrollment("Owner")
+        await monitor._enrollment_task
+
+    asyncio.run(scenario())
+    assert clock[0] == 60.0
+    assert len(store.load_embeddings(factory)) == 30
+    assert monitor.status()["face_enrollment"] == "completed"
+
+
+def test_remember_my_face_starts_background_enrollment(tmp_path, monkeypatch):
+    from app.services.vision import monitor as monitor_module
+
+    monkeypatch.setattr(monitor_module, "VOICE_ENROLL_SECONDS", 10.0)
+    monitor, factory = make_monitor(tmp_path)
+    application = SimpleNamespace(state=SimpleNamespace(vision=monitor, db_factory=factory))
+    monkeypatch.setattr(commands.local_brain, "user_name", lambda factory, user_id: "Owner")
+
+    async def scenario():
+        reply = await commands.route(application, "dev", None, "remember my face")
+        assert "60 seconds" in reply
+        assert monitor.status()["face_enrollment"] == "tracking"
+        await monitor.stop()
+        assert monitor.status()["face_enrollment"] == "cancelled"
+
+    asyncio.run(scenario())
+    assert store.identities(factory) == {}
+
+
+def test_stale_remote_frame_cannot_count_as_multiple_enrollment_samples(tmp_path, monkeypatch):
+    from app.services.vision import monitor as monitor_module
+
+    monkeypatch.setattr(monitor_module, "VOICE_ENROLL_SECONDS", 0.06)
+    monkeypatch.setattr(monitor_module, "VOICE_ENROLL_INTERVAL", 0.01)
+    monitor, factory = make_monitor(tmp_path)
+    monitor.settings.camera_source = "device"
+    monitor.push_remote(FRAME)
+    monitor.engine.faces = lambda frame: [(np.zeros(1), vec(1))]
+
+    async def scenario():
+        monitor.start_voice_enrollment("Owner")
+        await monitor._enrollment_task
+
+    asyncio.run(scenario())
+    assert monitor.status()["face_enrollment"] == "failed"
+    assert store.identities(factory) == {}
 
 
 def test_stranger_with_owner_is_remembered_silently(tmp_path):

@@ -12,7 +12,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-from app.services.vision import engine, store
+from app.services.vision import engine, gestures, store
 from app.services.vision.telegram import TelegramClient
 
 logger = logging.getLogger(__name__)
@@ -28,6 +28,10 @@ INTRUDER_RECORD_SECONDS = 45.0
 GREETING_COOLDOWN = 300.0
 LEARN_COOLDOWN = 30.0
 LEARN_SCORE_CEILING = 0.8
+VOICE_ENROLL_SECONDS = 60.0
+VOICE_ENROLL_INTERVAL = 2.0
+VOICE_ENROLL_MIN_SAMPLES = 3
+VOICE_ENROLL_CONSISTENCY = 0.55
 
 
 class VisionError(RuntimeError):
@@ -39,6 +43,8 @@ class VisionMonitor:
         self.application = application
         self.settings = application.state.settings
         self.engine = engine.FaceEngine(low_memory=self.settings.camera_low_memory)
+        self.gesture_recognizer: gestures.GestureRecognizer | None = None
+        self.gesture_gate = gestures.GestureGate()
         self.gallery = engine.FaceGallery()
         self.telegram = TelegramClient(self.settings.telegram_bot_token, self.settings.telegram_chat_id)
         self.root = Path(self.settings.vision_dir).expanduser().resolve()
@@ -47,6 +53,9 @@ class VisionMonitor:
         self.people: dict[str, dict] = {}
         self._task: asyncio.Task | None = None
         self._analysis: asyncio.Task | None = None
+        self._enrollment_task: asyncio.Task | None = None
+        self._enrollment_lock = asyncio.Lock()
+        self._enrollment_status = "idle"
         self._cap = None
         self._cap_lock = threading.Lock()
         self._remote: tuple[np.ndarray, float] | None = None
@@ -87,18 +96,41 @@ class VisionMonitor:
     async def set_enabled(self, enabled: bool) -> None:
         self.enabled = enabled
         if enabled and (self._task is None or self._task.done()):
+            if self.settings.gesture_enabled and self.gesture_recognizer is None:
+                try:
+                    self.gesture_recognizer = await asyncio.to_thread(
+                        gestures.GestureRecognizer, self.settings.gesture_model_path,
+                    )
+                except gestures.GestureUnavailable as exc:
+                    logger.error("Gesture recognition unavailable: %s", exc)
+                    await self._log("gesture_unavailable", str(exc))
             self._started = time.monotonic()
             self._task = asyncio.create_task(self._loop(), name="vision-monitor")
         elif not enabled:
+            self.gesture_gate.update(None, None)
             if self._task is not None:
                 self._task.cancel()
+                await asyncio.gather(self._task, return_exceptions=True)
                 self._task = None
+            if self._analysis is not None:
+                await asyncio.gather(self._analysis, return_exceptions=True)
+                self._analysis = None
             self._close_writer()
             self._release_camera()
         await self._log("monitor_on" if enabled else "monitor_off", "Camera security " + ("enabled" if enabled else "disabled"))
 
     async def stop(self) -> None:
+        if self._enrollment_task is not None and not self._enrollment_task.done():
+            self._enrollment_task.cancel()
+            await asyncio.gather(self._enrollment_task, return_exceptions=True)
+            if self._enrollment_status == "tracking":
+                self._enrollment_status = "cancelled"
         await self.set_enabled(False)
+        if self._analysis is not None:
+            await asyncio.gather(self._analysis, return_exceptions=True)
+        if self.gesture_recognizer is not None:
+            await asyncio.to_thread(self.gesture_recognizer.close)
+            self.gesture_recognizer = None
 
     def uid(self, fallback: str | None = None) -> str | None:
         return self.user_id or fallback
@@ -146,6 +178,7 @@ class VisionMonitor:
                 await grab_discard(self)
         frame = await self.grab()
         if frame is None:
+            self.gesture_gate.update(None, None)
             raise VisionError("I can't see through the camera. Check that it is plugged in and not used by another app.")
         self.last_frame_at = time.monotonic()
         if not self.enabled and not self._writer:
@@ -267,7 +300,8 @@ class VisionMonitor:
                     self._write(frame, reason, now)
                 elif self._writer is not None:
                     self._close_writer()
-                if now - last_analysis >= self.settings.camera_interval_seconds and (self._analysis is None or self._analysis.done()):
+                if (self._enrollment_status != "tracking" and now - last_analysis >= self.settings.camera_interval_seconds
+                        and (self._analysis is None or self._analysis.done())):
                     last_analysis = now
                     self._analysis = asyncio.create_task(self._analyse(frame.copy()))
                 await asyncio.sleep(RECORD_INTERVAL if self._writer else self.settings.camera_interval_seconds)
@@ -281,9 +315,41 @@ class VisionMonitor:
         try:
             faces = await asyncio.to_thread(self.engine.faces, frame)
             matches = [(vector, *self.gallery.match(vector)) for _, vector in faces]
-            await self._process(frame, matches)
+            if self._enrollment_status != "tracking":
+                await self._process(frame, matches)
+                await self._process_gesture(frame, matches)
         except Exception:
+            self.gesture_gate.update(None, None)
             logger.exception("Vision analysis error")
+
+    async def _process_gesture(self, frame: np.ndarray,
+                               matches: list[tuple[np.ndarray, str | None, float]]) -> None:
+        recognizer = self.gesture_recognizer
+        if recognizer is None:
+            return
+        identity = matches[0][1] if len(matches) == 1 else None
+        if identity is None or self.people.get(identity, {}).get("role") != "owner":
+            self.gesture_gate.update(None, None)
+            return
+        gesture = await asyncio.to_thread(recognizer.detect, frame)
+        if not self.enabled or self._enrollment_status == "tracking":
+            self.gesture_gate.update(None, None)
+            return
+        state = self.gesture_gate.update(identity, gesture)
+        if state is None:
+            return
+        from app.services.assistant import orchestrator
+
+        sockets = list(self.application.state.device_sockets.items())
+        if not sockets:
+            logger.warning("Gesture recognized but no assistant device is connected")
+            return
+        for device_id, websocket in sockets:
+            try:
+                await orchestrator._send_json(websocket, device_id, "animation.state", {"state": state})
+            except (RuntimeError, OSError):
+                logger.exception("Could not send gesture animation to device %s", device_id)
+        await self._log("gesture", f"Recognized {gesture}; requested {state} expression", identity)
 
     async def _process(self, frame: np.ndarray, matches: list[tuple[np.ndarray, str | None, float]]) -> None:
         factory = self.application.state.db_factory
@@ -367,6 +433,12 @@ class VisionMonitor:
 
     # ---------- on-request features ----------
     async def enroll(self, name: str, role: str, samples: int = 5) -> str:
+        if self._enrollment_lock.locked() or self._enrollment_status == "tracking":
+            raise VisionError("A face enrollment is already in progress.")
+        async with self._enrollment_lock:
+            return await self._enroll_samples(name, role, samples)
+
+    async def _enroll_samples(self, name: str, role: str, samples: int) -> str:
         vectors: list[np.ndarray] = []
         deadline = time.monotonic() + 12
         while len(vectors) < samples and time.monotonic() < deadline:
@@ -377,6 +449,9 @@ class VisionMonitor:
             await asyncio.sleep(0.5)
         if not vectors:
             raise VisionError("I couldn't see a face. Look at the camera and try again.")
+        return await self._save_enrollment(name, role, vectors)
+
+    async def _save_enrollment(self, name: str, role: str, vectors: list[np.ndarray]) -> str:
         factory = self.application.state.db_factory
         existing = await asyncio.to_thread(store.find_identity, factory, name)
         if existing is not None:
@@ -388,17 +463,58 @@ class VisionMonitor:
             identity_id = await asyncio.to_thread(store.create_identity, factory, self.user_id, name, role, vectors[0])
             for vector in vectors[1:]:
                 await asyncio.to_thread(store.add_embedding, factory, identity_id, vector)
-        # Merge any auto-created stranger identity that is really this person.
-        for vector in vectors:
-            other, _ = self.gallery.match(vector)
-            if other and other != identity_id and self.people.get(other, {}).get("role") == "stranger":
-                await asyncio.to_thread(store.delete_identity, factory, other)
         await self.reload()
         await self._log("face_enrolled", f"{name} remembered as {role} ({len(vectors)} samples)", identity_id)
         if role == "owner":
             self.owner_present = True
             self.last_owner = time.monotonic()
         return identity_id
+
+    def start_voice_enrollment(self, name: str) -> None:
+        if self._enrollment_lock.locked() or (self._enrollment_task is not None and not self._enrollment_task.done()):
+            raise VisionError("A face enrollment is already in progress.")
+        self._enrollment_status = "tracking"
+        self._enrollment_task = asyncio.create_task(self._voice_enrollment(name), name="voice-face-enrollment")
+
+    async def _voice_enrollment(self, name: str) -> None:
+        vectors: list[np.ndarray] = []
+        deadline = time.monotonic() + VOICE_ENROLL_SECONDS
+        last_remote_time: float | None = None
+        try:
+            async with self._enrollment_lock:
+                while time.monotonic() < deadline:
+                    frame = await self.grab()
+                    remote_time = (self._remote[1] if self.settings.camera_source in {"device", "auto"}
+                                   and self.remote_fresh() else None)
+                    new_frame = remote_time is None or remote_time != last_remote_time
+                    if remote_time is not None:
+                        last_remote_time = remote_time
+                    if frame is not None and new_frame:
+                        faces = await asyncio.to_thread(self.engine.faces, frame)
+                        if len(faces) == 1:
+                            vector = faces[0][1]
+                            if np.isfinite(vector).all() and (not vectors or float(vectors[0] @ vector) >= VOICE_ENROLL_CONSISTENCY):
+                                vectors.append(vector)
+                    await asyncio.sleep(min(VOICE_ENROLL_INTERVAL, max(0.0, deadline - time.monotonic())))
+                if len(vectors) < VOICE_ENROLL_MIN_SAMPLES:
+                    raise VisionError("I couldn't collect enough consistent face samples. Please try again alone in good light.")
+                await self._save_enrollment(name, "owner", vectors)
+            self._enrollment_status = "completed"
+            await self.announce(f"I saved your face samples, {name}. Recognition can still make mistakes.")
+        except asyncio.CancelledError:
+            self._enrollment_status = "cancelled"
+            raise
+        except VisionError as error:
+            self._enrollment_status = "failed"
+            logger.warning("Face enrollment failed: %s", error)
+            await self.announce(str(error))
+        except Exception:
+            self._enrollment_status = "failed"
+            logger.exception("Face enrollment failed")
+            await self.announce("Face enrollment failed. Check the backend logs and try again.")
+        finally:
+            if not self.enabled and not self._writer:
+                self._release_camera()
 
     async def who_is_here(self) -> list[str]:
         frame = await self.capture(settle=True)
@@ -457,6 +573,7 @@ class VisionMonitor:
             "recordings_saved": self.recordings_saved,
             "low_memory_mode": self.settings.camera_low_memory,
             "recognizer_loaded": self.engine.recognizer_loaded,
+            "face_enrollment": self._enrollment_status,
             "faces_remembered": len(self.people),
             "embeddings": self.gallery.count(),
             "telegram_configured": self.telegram.configured,

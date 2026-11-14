@@ -182,7 +182,8 @@ async def device_audio(websocket: WebSocket, device_id: str) -> None:
             pcm = await command_queue.get()
             try:
                 await process_command_audio(websocket.app, websocket, device_id, pcm)
-                if websocket.app.state.relisten.pop(device_id, False):
+                requested_relisten = websocket.app.state.relisten.pop(device_id, False)
+                if requested_relisten or websocket.app.state.device_games.get(device_id):
                     # A live game continues without requiring the wake word again.
                     vad.reset()
                     command_active = False
@@ -299,6 +300,11 @@ async def device_audio(websocket: WebSocket, device_id: str) -> None:
         websocket.app.state.device_capabilities[device_id] = (
             tuple(str(item) for item in capabilities[:8]) if isinstance(capabilities, list) and not is_simulated else ()
         )
+        if not is_simulated and hello.payload.get("game_active") is True:
+            websocket.app.state.device_games[device_id] = True
+            awaiting_command = True
+            command_started_at = time.monotonic()
+            logger.info("Resuming active on-device game after reconnect for %s", device_id)
         websocket.app.state.schedule_hashes.pop(device_id, None)
 
         # Record connected event in thread pool
@@ -359,7 +365,7 @@ async def device_audio(websocket: WebSocket, device_id: str) -> None:
         })
 
         command_task = asyncio.create_task(command_worker())
-        if boot_greeting_requested:
+        if boot_greeting_requested and not awaiting_command:
             logger.info("Starting one-time boot greeting for device %s", device_id)
             wake_greeting_active = True
             wake_greeting_task = asyncio.create_task(greet_after_wake(online=True))
@@ -531,13 +537,15 @@ async def device_audio(websocket: WebSocket, device_id: str) -> None:
                         command_audio.clear()
                         command_active = False
                         vad.reset()
+                        awaiting_command = bool(websocket.app.state.device_games.get(device_id))
+                        command_started_at = now_monotonic
                         await websocket.send_json({
                             "protocol_version": 1,
                             "message_id": f"idle-{frame.sequence}-{uuid4()}",
                             "device_id": device_id,
                             "timestamp": datetime.now(timezone.utc).isoformat(),
                             "type": "animation.state",
-                            "payload": {"state": "idle"},
+                            "payload": {"state": "listening" if awaiting_command else "idle"},
                         })
                         await websocket.send_json({
                             "protocol_version": 1,
@@ -552,13 +560,15 @@ async def device_audio(websocket: WebSocket, device_id: str) -> None:
                     command_audio.clear()
                     command_active = False
                     vad.reset()
+                    awaiting_command = bool(websocket.app.state.device_games.get(device_id))
+                    command_started_at = now_monotonic
                     await websocket.send_json({
                         "protocol_version": 1,
                         "message_id": f"idle-{frame.sequence}-{uuid4()}",
                         "device_id": device_id,
                         "timestamp": datetime.now(timezone.utc).isoformat(),
                         "type": "animation.state",
-                        "payload": {"state": "idle"},
+                        "payload": {"state": "listening" if awaiting_command else "idle"},
                     })
                     await websocket.send_json({
                         "protocol_version": 1,
@@ -606,6 +616,9 @@ async def device_audio(websocket: WebSocket, device_id: str) -> None:
                         try:
                             command_queue.put_nowait(completed_audio)
                         except asyncio.QueueFull:
+                            if websocket.app.state.device_games.get(device_id):
+                                awaiting_command = True
+                                command_started_at = now_monotonic
                             await websocket.send_json({
                                 "protocol_version": 1,
                                 "message_id": f"voice-busy-{frame.sequence}",
@@ -615,8 +628,8 @@ async def device_audio(websocket: WebSocket, device_id: str) -> None:
                                 "payload": {"code": "voice_processing_busy"},
                             })
 
-                listen_window = 120 if websocket.app.state.device_games.get(device_id) else 30
-                if awaiting_command and now_monotonic - command_started_at > listen_window:
+                if (awaiting_command and not websocket.app.state.device_games.get(device_id)
+                        and now_monotonic - command_started_at > 30):
                     awaiting_command = False
                     websocket.app.state.wake_briefings.pop(device_id, None)
                     go_home_after_reply(websocket.app, websocket, device_id, hold=0.0)
@@ -769,9 +782,9 @@ async def device_audio(websocket: WebSocket, device_id: str) -> None:
         if command_task is not None:
             command_task.cancel()
             await asyncio.gather(command_task, return_exceptions=True)
-        websocket.app.state.device_games.pop(device_id, None)
-        websocket.app.state.relisten.pop(device_id, None)
         if websocket.app.state.device_sockets.get(device_id) is websocket:
+            websocket.app.state.device_games.pop(device_id, None)
+            websocket.app.state.relisten.pop(device_id, None)
             websocket.app.state.device_capabilities.pop(device_id, None)
         if websocket.app.state.device_sockets.get(device_id) is websocket:
             websocket.app.state.devices.pop(device_id, None)

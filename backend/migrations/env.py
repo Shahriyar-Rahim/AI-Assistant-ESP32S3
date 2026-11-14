@@ -11,7 +11,10 @@ from app import models  # noqa: F401
 config = context.config
 if config.config_file_name is not None:
     fileConfig(config.config_file_name)
-config.set_main_option("sqlalchemy.url", os.getenv("DATABASE_URL", Settings.from_env().database_url))
+database_url = os.getenv("DATABASE_URL")
+if database_url is None:
+    database_url = Settings.from_env().database_url
+config.set_main_option("sqlalchemy.url", database_url)
 target_metadata = Base.metadata
 
 

@@ -180,3 +180,208 @@ def test_short_command_works_before_first_enrollment_in_onboarding_mode(tmp_path
         for message in websocket.messages
     )
     assert spoken == ["It is noon."]
+
+
+def test_game_letter_and_empty_transcript(tmp_path: Path, monkeypatch) -> None:
+    application = create_app(_settings(tmp_path))
+    transcripts = iter(["A", ""])
+    resolved: list[str] = []
+    spoken: list[str] = []
+
+    async def transcribe(*_args):
+        return next(transcripts), {"provider": "test", "model": "test", "language": "en"}
+
+    async def resolve(_app, _device, _user, transcript, _socket):
+        resolved.append(transcript)
+        return "No, A is not in the word. Try another letter."
+
+    async def speak(_app, _socket, _device, text):
+        spoken.append(text)
+
+    monkeypatch.setattr(orchestrator, "_transcribe", transcribe)
+    monkeypatch.setattr(orchestrator, "_resolve", resolve)
+    monkeypatch.setattr(orchestrator, "_speak", speak)
+    monkeypatch.setattr(orchestrator, "record_interaction", lambda *_args, **_kwargs: None)
+    websocket = RecordingWebSocket()
+    with TestClient(application):
+        with application.state.db_factory() as db:
+            user_id = db.query(User).filter(User.username == "admin").one().id
+        monkeypatch.setattr(
+            orchestrator, "verify_command_audio",
+            lambda *_args, **_kwargs: VerificationResult(True, "verified", 0.99, user_id),
+        )
+        application.state.device_games["dev"] = True
+        asyncio.run(orchestrator.process_command_audio(application, websocket, "dev", bytes(32000)))
+        asyncio.run(orchestrator.process_command_audio(application, websocket, "dev", bytes(32000)))
+
+    assert resolved == ["A"]
+    assert "Try another letter" in spoken[0]
+    assert "try your guess again" in spoken[1]
+    assert application.state.device_games["dev"]
+
+
+def test_unrecognized_game_speech_prompts_retry_without_ending_game(tmp_path: Path, monkeypatch) -> None:
+    application = create_app(_settings(tmp_path))
+    spoken: list[str] = []
+
+    async def transcribe(*_args):
+        raise ValueError("speech was not recognized")
+
+    async def speak(_app, _socket, _device, text):
+        spoken.append(text)
+
+    monkeypatch.setattr(orchestrator, "_transcribe", transcribe)
+    monkeypatch.setattr(orchestrator, "_speak", speak)
+    websocket = RecordingWebSocket()
+    with TestClient(application):
+        with application.state.db_factory() as db:
+            user_id = db.query(User).filter(User.username == "admin").one().id
+        monkeypatch.setattr(
+            orchestrator, "verify_command_audio",
+            lambda *_args, **_kwargs: VerificationResult(True, "verified", 0.99, user_id),
+        )
+        application.state.device_games["dev"] = True
+        asyncio.run(orchestrator.process_command_audio(application, websocket, "dev", bytes(32000)))
+
+    assert application.state.device_games["dev"]
+    assert spoken == ["I didn't catch that. Please try your guess again."]
+    assert not any(m["type"] == "animation.state" and m["payload"].get("state") == "idle"
+                   for m in websocket.messages)
+
+
+def test_private_memory_voice_requires_verified_enrollment(tmp_path: Path, monkeypatch) -> None:
+    from cryptography.fernet import Fernet
+    from app.models import LearnedResponse
+
+    settings = replace(_settings(tmp_path), voice_encryption_key=Fernet.generate_key().decode())
+    application = create_app(settings)
+    spoken: list[str] = []
+    reason = "enrollment_not_required"
+    transcript = "remember that my home is near the park"
+    semantic_calls = []
+
+    async def transcribe(*_args):
+        return transcript, {"provider": "test", "model": "test", "language": "en"}
+
+    async def speak(_app, _socket, _device, text):
+        spoken.append(text)
+
+    async def semantic(_factory, _settings, current_user, text, *, verified):
+        semantic_calls.append((current_user, text, verified))
+        return "semantic result"
+
+    monkeypatch.setattr(orchestrator, "_transcribe", transcribe)
+    monkeypatch.setattr(orchestrator, "_speak", speak)
+    monkeypatch.setattr(orchestrator, "record_interaction", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(orchestrator.private_memory, "semantic_recall", semantic)
+    with TestClient(application):
+        with application.state.db_factory() as db:
+            user_id = db.query(User).filter(User.username == "admin").one().id
+        monkeypatch.setattr(
+            orchestrator, "verify_command_audio",
+            lambda *_args, **_kwargs: VerificationResult(True, reason, 0.99, user_id),
+        )
+        websocket = RecordingWebSocket()
+        asyncio.run(orchestrator.process_command_audio(application, websocket, "dev", bytes(32000)))
+        assert "verify" in spoken[-1]
+        with application.state.db_factory() as db:
+            assert db.query(LearnedResponse).filter_by(kind="private_fact").count() == 0
+        reason = "verified"
+        asyncio.run(orchestrator.process_command_audio(application, websocket, "dev", bytes(32000)))
+        assert "saved" in spoken[-1]
+        with application.state.db_factory() as db:
+            assert db.query(LearnedResponse).filter_by(kind="private_fact").count() == 1
+        transcript = "What is my favorite fruit?"
+        reason = "enrollment_not_required"
+        asyncio.run(orchestrator.process_command_audio(application, websocket, "dev", bytes(32000)))
+        assert "verify" in spoken[-1]
+        assert not semantic_calls
+        reason = "verified"
+        asyncio.run(orchestrator.process_command_audio(application, websocket, "dev", bytes(32000)))
+        assert spoken[-1] == "semantic result"
+        assert semantic_calls == [(user_id, transcript, True)]
+
+
+def test_cloud_failure_uses_configured_local_ollama(tmp_path: Path, monkeypatch) -> None:
+    from app.services.ai.providers import AIResult, ProviderRequestError
+
+    calls = []
+
+    class Cloud:
+        async def complete(self, _messages, model):
+            calls.append(("cloud", model))
+            raise ProviderRequestError("HTTP 429")
+
+    class Local:
+        async def complete(self, messages, model):
+            calls.append(("local", model))
+            assert messages[-1]["content"] == "Explain gravity"
+            return AIResult('{"kind":"reply","text":"Gravity pulls objects together."}', {}, model)
+
+    settings = replace(_settings(tmp_path), default_ai_provider="gemini", ai_model="cloud-model",
+                       ai_fallback_model="cloud-backup", ollama_fallback_model="local-model")
+    application = create_app(settings)
+    monkeypatch.setitem(orchestrator.PROVIDERS, "gemini", Cloud())
+    monkeypatch.setitem(orchestrator.PROVIDERS, "ollama", Local())
+    with TestClient(application):
+        with application.state.db_factory() as db:
+            user_id = db.query(User).filter(User.username == "admin").one().id
+        reply, action = asyncio.run(orchestrator._ai_fallback(application, "Explain gravity", user_id))
+    assert reply == "Gravity pulls objects together."
+    assert action is None
+    assert calls == [("cloud", "cloud-model"), ("cloud", "cloud-backup"), ("local", "local-model")]
+
+
+def test_short_no_reaches_pending_list_followup(tmp_path: Path, monkeypatch) -> None:
+    import time
+
+    application = create_app(_settings(tmp_path))
+    spoken = []
+
+    async def transcribe(*_args):
+        return "no", {"provider": "test", "model": "test", "language": "en"}
+
+    async def speak(_app, _socket, _device, text):
+        spoken.append(text)
+
+    monkeypatch.setattr(orchestrator, "_transcribe", transcribe)
+    monkeypatch.setattr(orchestrator, "_speak", speak)
+    monkeypatch.setattr(orchestrator, "record_interaction", lambda *_args, **_kwargs: None)
+    with TestClient(application):
+        with application.state.db_factory() as db:
+            user_id = db.query(User).filter(User.username == "admin").one().id
+        monkeypatch.setattr(
+            orchestrator, "verify_command_audio",
+            lambda *_args, **_kwargs: VerificationResult(True, "verified", 0.99, user_id),
+        )
+        application.state.pending_todo_lists["dev"] = (user_id, "list-id", "shopping", "confirm", time.monotonic() + 60)
+        asyncio.run(orchestrator.process_command_audio(application, RecordingWebSocket(), "dev", bytes(32000)))
+        assert "saved" in spoken[0]
+        assert "dev" not in application.state.pending_todo_lists
+
+
+def test_voice_volume_saves_and_rejects_non_admin(tmp_path: Path, monkeypatch) -> None:
+    from app.models import Device
+
+    application = create_app(_settings(tmp_path))
+    with TestClient(application):
+        with application.state.db_factory() as db:
+            admin = db.query(User).filter(User.username == "admin").one()
+            admin_id = admin.id
+            db.add(User(username="viewer", password_hash="test", role="user"))
+            db.add(Device(id="volume-device", name="Device", credential_hash="test", config={}))
+            db.commit()
+            viewer_id = db.query(User).filter(User.username == "viewer").one().id
+        reply = asyncio.run(orchestrator._resolve_command(
+            application, "volume-device", admin_id, "set volume to level fifty five"
+        ))
+        assert "55 percent" in reply and "reconnect" in reply
+        with application.state.db_factory() as db:
+            assert db.get(Device, "volume-device").config["volume"] == 55
+        denied = asyncio.run(orchestrator._resolve_command(
+            application, "volume-device", viewer_id, "set volume to 70"
+        ))
+        assert "administrator" in denied
+        assert asyncio.run(orchestrator._resolve_command(
+            application, "volume-device", admin_id, "set volume to 101"
+        )).startswith("Volume must be")

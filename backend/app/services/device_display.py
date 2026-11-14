@@ -4,7 +4,7 @@ from datetime import datetime, timezone, tzinfo
 from typing import Any
 
 import httpx
-from sqlalchemy import func, select
+from sqlalchemy import func, or_, select
 
 from app.models import CalendarEvent, GameSession, Note, Notification, Reminder, Todo
 
@@ -63,17 +63,21 @@ def build_display_payload(
     *,
     tz: tzinfo | None = None,
     content: dict[str, Any] | None = None,
+    user_id: str | None = None,
 ) -> dict[str, Any]:
     if page not in DISPLAY_PAGES:
         raise ValueError(f"unsupported display page: {page}")
 
     now = datetime.now(timezone.utc)
     zone = tz or timezone.utc
+    def owner(column):
+        return True if user_id is None else or_(column == user_id, column.is_(None))
+
     with db_factory() as db:
         counts = {
-            "todos": db.scalar(select(func.count()).select_from(Todo).where(Todo.completed.is_(False))) or 0,
-            "reminders": db.scalar(select(func.count()).select_from(Reminder).where(Reminder.completed.is_(False))) or 0,
-            "notes": db.scalar(select(func.count()).select_from(Note)) or 0,
+            "todos": db.scalar(select(func.count()).select_from(Todo).where(Todo.completed.is_(False), owner(Todo.created_by))) or 0,
+            "reminders": db.scalar(select(func.count()).select_from(Reminder).where(Reminder.completed.is_(False), owner(Reminder.created_by))) or 0,
+            "notes": db.scalar(select(func.count()).select_from(Note).where(owner(Note.created_by))) or 0,
             "notifications": db.scalar(
                 select(func.count()).select_from(Notification).where(Notification.delivered.is_(False))
             ) or 0,
@@ -82,6 +86,7 @@ def build_display_payload(
                     CalendarEvent.kind == "alarm",
                     CalendarEvent.completed.is_(False),
                     CalendarEvent.start_at >= now,
+                    owner(CalendarEvent.created_by),
                 )
             ) or 0,
             "games": db.scalar(
@@ -91,7 +96,7 @@ def build_display_payload(
 
         if page == "todos":
             rows = db.execute(
-                select(Todo).where(Todo.completed.is_(False))
+                select(Todo).where(Todo.completed.is_(False), owner(Todo.created_by))
                 .order_by(Todo.due_at.is_(None), Todo.due_at, Todo.created_at.desc()).limit(3)
             ).scalars().all()
             items = [row.title for row in rows]
@@ -99,14 +104,14 @@ def build_display_payload(
             detail = f"{counts['todos']} PENDING"
         elif page == "reminders":
             rows = db.execute(
-                select(Reminder).where(Reminder.completed.is_(False))
+                select(Reminder).where(Reminder.completed.is_(False), owner(Reminder.created_by))
                 .order_by(Reminder.due_at).limit(3)
             ).scalars().all()
             items = [f"{row.title} {_clock(row.due_at, zone)}" for row in rows]
             title = "REMINDERS"
             detail = f"{counts['reminders']} ACTIVE"
         elif page == "notes":
-            rows = db.execute(select(Note).order_by(Note.created_at.desc()).limit(3)).scalars().all()
+            rows = db.execute(select(Note).where(owner(Note.created_by)).order_by(Note.created_at.desc()).limit(3)).scalars().all()
             items = [row.body.replace("\n", " ") for row in rows]
             title = "NOTES"
             detail = f"{counts['notes']} SAVED"
@@ -116,6 +121,7 @@ def build_display_payload(
                     CalendarEvent.kind == "alarm",
                     CalendarEvent.completed.is_(False),
                     CalendarEvent.start_at >= now,
+                    owner(CalendarEvent.created_by),
                 ).order_by(CalendarEvent.start_at).limit(3)
             ).scalars().all()
             items = [f"{row.title} {_clock(row.start_at, zone, '%d/%m %H:%M')}" for row in rows]
@@ -134,6 +140,8 @@ def build_display_payload(
                 select(CalendarEvent).where(
                     CalendarEvent.completed.is_(False),
                     CalendarEvent.start_at >= now,
+                    CalendarEvent.kind.not_in(("alarm", "timer")),
+                    owner(CalendarEvent.created_by),
                 ).order_by(CalendarEvent.start_at).limit(4)
             ).scalars().all()
             items = [
@@ -163,7 +171,8 @@ def build_display_payload(
         else:
             upcoming = db.execute(
                 select(CalendarEvent).where(
-                    CalendarEvent.completed.is_(False), CalendarEvent.start_at >= now
+                    CalendarEvent.completed.is_(False), CalendarEvent.start_at >= now,
+                    owner(CalendarEvent.created_by),
                 ).order_by(CalendarEvent.start_at).limit(2)
             ).scalars().all()
             title = "ASSISTANT"

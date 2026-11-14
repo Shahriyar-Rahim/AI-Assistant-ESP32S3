@@ -26,6 +26,7 @@ namespace
 
     QueueHandle_t frame_queue;
     SemaphoreHandle_t stream_lock;
+    SemaphoreHandle_t copy_available;
     uvc_host_stream_hdl_t stream = nullptr;
     uint8_t *jpeg_copy = nullptr;
     esp_http_client_handle_t http = nullptr;
@@ -34,11 +35,19 @@ namespace
 
     bool on_frame(const uvc_host_frame_t *frame, void *)
     {
-        if (frame->vs_format.format != UVC_VS_FORMAT_MJPEG)
+        if (frame == nullptr || frame->vs_format.format != UVC_VS_FORMAT_MJPEG ||
+            frame->data_len == 0 || frame->data_len > JPEG_COPY_CAPACITY)
             return true;
-        if (xQueueSend(frame_queue, &frame, 0) != pdPASS)
+        if (xSemaphoreTake(copy_available, 0) != pdTRUE)
             return true;
-        return false;
+        const size_t length = frame->data_len;
+        std::memcpy(jpeg_copy, frame->data, length);
+        if (xQueueSend(frame_queue, &length, 0) != pdPASS)
+        {
+            ESP_LOGW(TAG, "Cannot queue copied camera frame");
+            xSemaphoreGive(copy_available);
+        }
+        return true;
     }
 
     void on_stream_event(const uvc_host_stream_event_data_t *event, void *)
@@ -50,9 +59,12 @@ namespace
             xSemaphoreTake(stream_lock, portMAX_DELAY);
             if (stream != nullptr)
             {
-                uvc_host_stream_close(event->device_disconnected.stream_hdl);
-                stream = nullptr;
                 stream_active = false;
+                const esp_err_t result = uvc_host_stream_close(event->device_disconnected.stream_hdl);
+                if (result == ESP_OK)
+                    stream = nullptr;
+                else
+                    ESP_LOGE(TAG, "Cannot close disconnected USB camera stream: %s", esp_err_to_name(result));
             }
             xSemaphoreGive(stream_lock);
             break;
@@ -175,14 +187,6 @@ namespace
         return true;
     }
 
-    void drain_frames()
-    {
-        const uvc_host_frame_t *discarded = nullptr;
-        while (xQueueReceive(frame_queue, &discarded, 0) == pdTRUE)
-        {
-        }
-    }
-
     void camera_task(void *)
     {
         int64_t last_post = 0;
@@ -190,38 +194,39 @@ namespace
         {
             if (!stream_active)
             {
-                drain_frames();
+                xSemaphoreTake(stream_lock, portMAX_DELAY);
+                const bool close_pending = stream != nullptr;
+                if (close_pending)
+                {
+                    const esp_err_t result = uvc_host_stream_close(stream);
+                    if (result == ESP_OK)
+                        stream = nullptr;
+                    else
+                        ESP_LOGE(TAG, "Cannot close USB camera stream: %s", esp_err_to_name(result));
+                }
+                const bool can_open = stream == nullptr;
+                xSemaphoreGive(stream_lock);
+                if (!can_open)
+                {
+                    vTaskDelay(pdMS_TO_TICKS(4000));
+                    continue;
+                }
                 if (!open_stream())
                 {
                     vTaskDelay(pdMS_TO_TICKS(4000));
                     continue;
                 }
             }
-            const uvc_host_frame_t *frame = nullptr;
-            if (xQueueReceive(frame_queue, &frame, pdMS_TO_TICKS(3000)) != pdTRUE)
-                continue;
-
             size_t length = 0;
-            bool want = false;
-            xSemaphoreTake(stream_lock, portMAX_DELAY);
-            if (stream != nullptr && frame != nullptr)
+            if (xQueueReceive(frame_queue, &length, pdMS_TO_TICKS(3000)) != pdTRUE)
+                continue;
+            const int64_t now = esp_timer_get_time();
+            if (now - last_post >= POST_INTERVAL_US)
             {
-                const int64_t now = esp_timer_get_time();
-                want = now - last_post >= POST_INTERVAL_US && frame->data_len > 0 && frame->data_len <= JPEG_COPY_CAPACITY;
-                if (want)
-                {
-                    std::memcpy(jpeg_copy, frame->data, frame->data_len);
-                    length = frame->data_len;
-                    last_post = now;
-                }
-                uvc_host_frame_return(stream, const_cast<uvc_host_frame_t *>(frame));
-            }
-            xSemaphoreGive(stream_lock);
-
-            if (want)
-            {
+                last_post = now;
                 post_frame(length);
             }
+            xSemaphoreGive(copy_available);
         }
     }
 
@@ -233,10 +238,12 @@ namespace DeviceCamera
     esp_err_t start()
     {
         jpeg_copy = static_cast<uint8_t *>(heap_caps_malloc(JPEG_COPY_CAPACITY, MALLOC_CAP_SPIRAM));
-        frame_queue = xQueueCreate(FRAME_BUFFERS, sizeof(uvc_host_frame_t *));
+        frame_queue = xQueueCreate(1, sizeof(size_t));
         stream_lock = xSemaphoreCreateMutex();
-        if (jpeg_copy == nullptr || frame_queue == nullptr || stream_lock == nullptr)
+        copy_available = xSemaphoreCreateBinary();
+        if (jpeg_copy == nullptr || frame_queue == nullptr || stream_lock == nullptr || copy_available == nullptr)
             return ESP_ERR_NO_MEM;
+        xSemaphoreGive(copy_available);
 
         usb_host_config_t host_config{};
         host_config.skip_phy_setup = false;

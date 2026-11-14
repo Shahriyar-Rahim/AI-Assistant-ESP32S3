@@ -13,6 +13,20 @@ def test_parse_commands():
     assert dg.parse_game_command("what time is it", False) is None
 
 
+def test_local_random_utilities_and_continuation():
+    assert dg.parse_game_command("roll a die", False) == ("start", "dice")
+    assert dg.parse_game_command("spin the roulette wheel", False) == ("start", "roulette")
+    assert dg.parse_game_command("choose a decision symbol", False) == ("start", "symbols")
+    assert dg.parse_game_command("play dice", False) == ("start", "dice")
+    assert dg.parse_game_command("roll a die", True) is None
+    app = make_app()
+    app.state.device_games["dev"] = True
+    socket = FakeSocket(app, {"handled": True, "speech": "Rolled a 4.", "active": True})
+    assert asyncio.run(dg.route_device_game(app, socket, "dev", "roll again")) == "Rolled a 4."
+    assert socket.sent[0]["payload"]["action"] == "input"
+    assert app.state.relisten["dev"]
+
+
 class FakeSocket:
     def __init__(self, app, reply):
         self.app, self.reply, self.sent = app, reply, []
@@ -35,7 +49,7 @@ def make_app(simulated=False):
     engine = create_engine("sqlite://", poolclass=StaticPool, connect_args={"check_same_thread": False})
     Base.metadata.create_all(engine)
     return SimpleNamespace(state=SimpleNamespace(
-        devices={"dev": (0, simulated)}, game_waiters={}, device_games={}, relisten={}, home_tasks={}, pending_suggestions={}, audio_echo_until={},
+        devices={"dev": (0, simulated)}, game_waiters={}, device_games={}, relisten={}, home_tasks={}, pending_suggestions={}, audio_echo_until={}, pending_reminders={}, pending_calendar_events={},
         db_factory=sessionmaker(engine, expire_on_commit=False),
     ))
 
@@ -131,3 +145,20 @@ def test_game_list_keeps_listening_and_schedules_home():
 def test_go_home_stops_an_active_game():
     assert dg.parse_game_command("go to the home page", True) == ("stop", None)
     assert dg.parse_game_command("go to the home page", False) is None
+
+
+def test_active_letter_bypasses_command_repair(monkeypatch):
+    from app.services.assistant import orchestrator
+
+    app = make_app()
+    app.state.device_games["dev"] = True
+
+    def unexpected_repair(*_args):
+        raise AssertionError("a game letter must not be repaired into another command")
+
+    async def resolve_command(_app, _device, _user, transcript, _socket):
+        return transcript
+
+    monkeypatch.setattr(orchestrator.command_repair, "repair", unexpected_repair)
+    monkeypatch.setattr(orchestrator, "_resolve_command", resolve_command)
+    assert asyncio.run(orchestrator._resolve(app, "dev", "user", "A", object())) == "A"

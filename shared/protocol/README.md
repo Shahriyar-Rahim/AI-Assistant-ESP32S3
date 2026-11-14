@@ -2,6 +2,8 @@
 
 Control messages are UTF-8 JSON matching `control.schema.json`. Each control message has a protocol version, unique message ID, device ID, UTC timestamp, type, and object payload. Audio uses a WebSocket binary message, never unframed PCM mixed with JSON.
 
+The physical device's `device.hello` payload includes the optional boolean `game_active`, reflecting its current local game state. When true, the backend restores game routing and listening after a WebSocket reconnect. Older devices that omit the field start in the normal wake-word state; a device reboot still clears its in-memory game session.
+
 ## Binary PCM frame
 
 All integers are unsigned, network byte order. The 25-byte header is followed by exactly `sample_count * channels * 2` bytes of signed little-endian PCM:

@@ -78,7 +78,11 @@ async def update_device_config(
     request: Request,
     user: User = Depends(require_admin),
 ) -> dict[str, object]:
-    allowed = {"brightness", "microphone_enabled", "display", "listening_policy"}
+    return await set_device_config(request.app, device_id, body, user.id)
+
+
+async def set_device_config(application, device_id: str, body: dict[str, object], user_id: str) -> dict[str, object]:
+    allowed = {"brightness", "microphone_enabled", "volume", "display", "listening_policy"}
     if not body or set(body) - allowed:
         raise HTTPException(422, "configuration contains no values or unsupported keys")
     if "brightness" in body and (
@@ -89,7 +93,11 @@ async def update_device_config(
         raise HTTPException(422, "brightness must be an integer from 0 to 100")
     if "microphone_enabled" in body and not isinstance(body["microphone_enabled"], bool):
         raise HTTPException(422, "microphone_enabled must be boolean")
-    with request.app.state.db_factory() as db:
+    if "volume" in body and (
+        not isinstance(body["volume"], int) or isinstance(body["volume"], bool) or not 0 <= body["volume"] <= 100
+    ):
+        raise HTTPException(422, "volume must be an integer from 0 to 100")
+    with application.state.db_factory() as db:
         device = db.get(Device, device_id)
         if device is None:
             raise HTTPException(404, "device not found")
@@ -101,10 +109,10 @@ async def update_device_config(
             device_id=device_id,
             action="device configuration updated",
             result="success",
-            metadata_json={"user_id": user.id, "keys": sorted(body)},
+            metadata_json={"user_id": user_id, "keys": sorted(body)},
         ))
         db.commit()
-    websocket = request.app.state.device_sockets.get(device_id)
+    websocket = application.state.device_sockets.get(device_id)
     if websocket is not None:
         from datetime import datetime, timezone
         import uuid

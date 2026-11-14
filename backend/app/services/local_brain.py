@@ -109,7 +109,9 @@ def _upsert(db_factory, user_id: str | None, kind: str, prompt: str, response: d
             count = db.scalar(select(func.count()).select_from(LearnedResponse).where(LearnedResponse.user_id == user_id)) or 0
             if count >= MAX_ENTRIES_PER_USER:
                 stale = db.execute(
-                    select(LearnedResponse.id).where(LearnedResponse.user_id == user_id, LearnedResponse.kind != "fact")
+                    select(LearnedResponse.id).where(
+                        LearnedResponse.user_id == user_id, LearnedResponse.kind.not_in(("fact", "private_fact")),
+                    )
                     .order_by(LearnedResponse.uses, LearnedResponse.last_used_at).limit(count - MAX_ENTRIES_PER_USER + 1)
                 ).scalars().all()
                 if stale:
@@ -247,7 +249,7 @@ def stats(db_factory, user_id: str | None) -> dict[str, Any]:
     with db_factory() as db:
         rows = db.execute(select(LearnedResponse).where(LearnedResponse.user_id == user_id)).scalars().all()
     kinds = Counter(row.kind for row in rows)
-    top = sorted((row for row in rows if row.kind != "fact"), key=lambda row: row.uses, reverse=True)[:10]
+    top = sorted((row for row in rows if row.kind not in {"fact", "private_fact"}), key=lambda row: row.uses, reverse=True)[:10]
     return {
         "entries": len(rows),
         "kinds": dict(kinds),
@@ -261,8 +263,9 @@ def stats(db_factory, user_id: str | None) -> dict[str, Any]:
         "recent": [
             {"id": row.id, "kind": row.kind, "prompt": row.prompt, "uses": row.uses, "source": row.source,
              "answer": (row.response.get("text") or row.response.get("name") or "")[:160]}
-            for row in sorted(rows, key=lambda row: row.created_at, reverse=True)[:15] if row.kind != "fact"
-        ],
+            for row in sorted(rows, key=lambda row: row.created_at, reverse=True)
+            if row.kind not in {"fact", "private_fact"}
+        ][:15],
     }
 
 

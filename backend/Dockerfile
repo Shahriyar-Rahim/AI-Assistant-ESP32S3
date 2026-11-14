@@ -19,9 +19,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # 2. Copy requirement files
 COPY backend/requirements.txt ./requirements.txt
 COPY backend/requirements-wakeword.txt ./requirements-wakeword.txt
+COPY backend/requirements-mem0.txt ./requirements-mem0.txt
 
 # 3. Install core dependencies, helper packages (tqdm, requests), then openwakeword
-RUN pip install --no-cache-dir -r requirements.txt \
+RUN pip install --no-cache-dir -r requirements.txt -r requirements-mem0.txt \
     && pip install --no-cache-dir onnxruntime scikit-learn tqdm requests \
     && pip install --no-cache-dir --no-deps openwakeword>=0.6.0
 

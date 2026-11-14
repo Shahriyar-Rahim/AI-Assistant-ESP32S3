@@ -20,6 +20,8 @@ from app.models.domain import (
     ProviderConfig,
     Reminder,
     Todo,
+    TodoList,
+    TodoListMember,
     User,
     VoiceEnrollment,
     VoiceInteraction,
@@ -30,5 +32,5 @@ __all__ = [
     "AuditLog", "CalendarEvent", "Conversation", "ConversationMessage", "Device",
     "AutomationEndpoint", "AutomationRule", "DisplayConfiguration", "EndpointHealthCheck", "GameResult", "GameSession", "LearnedResponse", "IntegrationAccount",
     "Notification", "Note", "OAuthState", "ProviderConfig", "Reminder", "User",
-    "Todo", "VoiceEnrollment", "VoiceInteraction", "VoiceLearningProfile", "OTARelease",
+    "Todo", "TodoList", "TodoListMember", "VoiceEnrollment", "VoiceInteraction", "VoiceLearningProfile", "OTARelease",
 ]

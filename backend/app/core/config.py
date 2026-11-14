@@ -57,6 +57,12 @@ class Settings:
     wake_weather: bool = True
     local_brain_first: bool = True
     ai_fallback_model: str = "gemini-3.1-flash-lite"
+    ollama_fallback_model: str = ""
+    private_memory_model: str = ""
+    private_memory_ollama_url: str = "http://127.0.0.1:11434"
+    mem0_enabled: bool = False
+    mem0_embedding_model: str = "all-minilm"
+    mem0_embedding_dimensions: int = 384
     news_default_country: str = "US"
     telegram_bot_token: str = ""
     telegram_chat_id: str = ""
@@ -68,6 +74,8 @@ class Settings:
     camera_away_record_after_seconds: float = 60.0
     camera_segment_seconds: int = 300
     camera_low_memory: bool = True
+    gesture_enabled: bool = False
+    gesture_model_path: str = ""
     vision_dir: str = "data/vision"
 
     @classmethod
@@ -142,6 +150,12 @@ class Settings:
             wake_weather=flag("WAKE_WEATHER"),
             local_brain_first=flag("LOCAL_BRAIN_FIRST"),
             ai_fallback_model=os.getenv("AI_FALLBACK_MODEL", "gemini-3.1-flash-lite").strip(),
+            ollama_fallback_model=os.getenv("OLLAMA_FALLBACK_MODEL", "").strip(),
+            private_memory_model=os.getenv("PRIVATE_MEMORY_MODEL", "").strip(),
+            private_memory_ollama_url=os.getenv("PRIVATE_MEMORY_OLLAMA_URL", "http://127.0.0.1:11434").strip(),
+            mem0_enabled=os.getenv("MEM0_ENABLED", "false").strip().casefold() in {"1", "true", "yes", "on"},
+            mem0_embedding_model=os.getenv("MEM0_EMBEDDING_MODEL", "all-minilm").strip(),
+            mem0_embedding_dimensions=int(os.getenv("MEM0_EMBEDDING_DIMENSIONS", "384")),
             telegram_bot_token=os.getenv("TELEGRAM_BOT_TOKEN", "").strip(),
             telegram_chat_id=os.getenv("TELEGRAM_CHAT_ID", "").strip(),
             camera_enabled=os.getenv("CAMERA_ENABLED", "false").strip().casefold() in {"1", "true", "yes", "on"},
@@ -152,6 +166,8 @@ class Settings:
             camera_away_record_after_seconds=float(os.getenv("CAMERA_AWAY_RECORD_AFTER_SECONDS", "60")),
             camera_segment_seconds=int(os.getenv("CAMERA_SEGMENT_SECONDS", "300")),
             camera_low_memory=os.getenv("CAMERA_LOW_MEMORY", "true").strip().casefold() in {"1", "true", "yes", "on"},
+            gesture_enabled=os.getenv("GESTURE_ENABLED", "false").strip().casefold() in {"1", "true", "yes", "on"},
+            gesture_model_path=os.getenv("GESTURE_MODEL_PATH", "").strip(),
             vision_dir=os.getenv("VISION_DIR", "data/vision").strip(),
             news_default_country=os.getenv("NEWS_DEFAULT_COUNTRY", "US").strip().upper()[:2] or "US",
             database_url=os.getenv("DATABASE_URL", "sqlite:///./assistant.db"),
