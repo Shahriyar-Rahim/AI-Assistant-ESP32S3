@@ -4,6 +4,8 @@ import asyncio
 import os
 from functools import lru_cache
 
+from app.services.biometric.anti_spoof import trim_silence
+
 
 class LocalSpeechUnavailable(RuntimeError):
     pass
@@ -50,17 +52,21 @@ def transcribe_pcm_sync(
 ) -> tuple[str, dict[str, object]]:
     if language not in {"en", "bn"}:
         raise ValueError("language must be 'en' or 'bn'")
-    pcm16le_to_wav(pcm)
+    if not pcm or len(pcm) % 2:
+        raise ValueError("PCM audio must contain complete 16-bit samples")
     try:
         import numpy as np
     except ImportError as exc:
         raise LocalSpeechUnavailable("install NumPy to preprocess local Whisper audio") from exc
-    waveform = np.frombuffer(pcm, dtype="<i2").astype(np.float32) / 32768.0
+
+    trimmed_pcm = trim_silence(pcm, min_active_ms=400)
+    waveform = np.frombuffer(trimmed_pcm, dtype="<i2").astype(np.float32) / 32768.0
     try:
         segments, info = _load_model(model_name, device, compute_type).transcribe(
             waveform,
             language=language,
-            beam_size=5,
+            beam_size=1,
+            best_of=1,
             vad_filter=False,
             condition_on_previous_text=False,
         )

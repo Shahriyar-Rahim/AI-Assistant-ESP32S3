@@ -50,25 +50,6 @@ namespace
     constexpr EventBits_t START_AP_BIT = BIT1;
     constexpr EventBits_t WEBSOCKET_READY_BIT = BIT2;
 
-    constexpr char RENDER_ROOT_CA_PEM[] =
-        "-----BEGIN CERTIFICATE-----\n"
-        "MIICnzCCAiWgAwIBAgIQf/MZd5csIkp2FV0TttaF4zAKBggqhkjOPQQDAzBHMQsw\n"
-        "CQYDVQQGEwJVUzEiMCAGA1UEChMZR29vZ2xlIFRydXN0IFNlcnZpY2VzIExMQzEU\n"
-        "MBIGA1UEAxMLR1RTIFJvb3QgUjQwHhcNMjMxMjEzMDkwMDAwWhcNMjkwMjIwMTQw\n"
-        "MDAwWjA7MQswCQYDVQQGEwJVUzEeMBwGA1UEChMVR29vZ2xlIFRydXN0IFNlcnZp\n"
-        "Y2VzMQwwCgYDVQQDEwNXRTEwWTATBgcqhkjOPQIBBggqhkjOPQMBBwNCAARvzTr+\n"
-        "Z1dHTCEDhUDCR127WEcPQMFcF4XGGTfn1XzthkubgdnXGhOlCgP4mMTG6J7/EFmP\n"
-        "LCaY9eYmJbsPAvpWo4H+MIH7MA4GA1UdDwEB/wQEAwIBhjAdBgNVHSUEFjAUBggr\n"
-        "BgEFBQcDAQYIKwYBBQUHAwIwEgYDVR0TAQH/BAgwBgEB/wIBADAdBgNVHQ4EFgQU\n"
-        "kHeSNWfE/6jMqeZ72YB5e8yT+TgwHwYDVR0jBBgwFoAUgEzW63T/STaj1dj8tT7F\n"
-        "avCUHYwwNAYIKwYBBQUHAQEEKDAmMCQGCCsGAQUFBzAChhhodHRwOi8vaS5wa2ku\n"
-        "Z29vZy9yNC5jcnQwKwYDVR0fBCQwIjAgoB6gHIYaaHR0cDovL2MucGtpLmdvb2cv\n"
-        "ci9yNC5jcmwwEwYDVR0gBAwwCjAIBgZngQwBAgEwCgYIKoZIzj0EAwMDaAAwZQIx\n"
-        "AOcCq1HW90OVznX+0RGU1cxAQXomvtgM8zItPZCuFQ8jSBJSjz5keROv9aYsAm5V\n"
-        "sQIwJonMaAFi54mrfhfoFNZEfuNMSQ6/bIBiNLiyoX46FohQvKeIoJ99cx7sUkFN\n"
-        "7uJW\n"
-        "-----END CERTIFICATE-----\n";
-
     constexpr size_t AUDIO_HEADER_SIZE = 25;
     constexpr size_t MAX_AUDIO_FRAME_SAMPLES = HardwareConfig::Audio::CAPTURE_SAMPLES * 4;
     constexpr size_t MAX_PACKET_SIZE = AUDIO_HEADER_SIZE + MAX_AUDIO_FRAME_SAMPLES * sizeof(int16_t);
@@ -1963,7 +1944,8 @@ o.textContent=await r.text();}
                 {
                     const esp_err_t applied = AudioI2S::set_volume(static_cast<unsigned>(volume->valueint));
                     const esp_err_t saved = applied == ESP_OK
-                        ? persist_runtime_setting("volume", static_cast<uint8_t>(volume->valueint)) : applied;
+                                                ? persist_runtime_setting("volume", static_cast<uint8_t>(volume->valueint))
+                                                : applied;
                     if (saved != ESP_OK)
                         ESP_LOGE(TAG, "Cannot apply or persist volume: %s", esp_err_to_name(saved));
                 }
@@ -2214,18 +2196,30 @@ o.textContent=await r.text();}
         }
 
         {
-            const esp_sntp_config_t sntp_config = ESP_NETIF_SNTP_DEFAULT_CONFIG("pool.ntp.org");
+            esp_sntp_config_t sntp_config = ESP_NETIF_SNTP_DEFAULT_CONFIG("pool.ntp.org");
             esp_err_t time_result = esp_netif_sntp_init(&sntp_config);
-            if (time_result == ESP_OK)
+            if (time_result == ESP_OK || time_result == ESP_ERR_INVALID_STATE)
             {
-                time_result = esp_netif_sntp_sync_wait(pdMS_TO_TICKS(10000));
+                time_result = esp_netif_sntp_sync_wait(pdMS_TO_TICKS(15000));
                 if (time_result != ESP_OK)
-                    ESP_LOGW(TAG, "NTP time sync unavailable; continuing with device clock");
+                    ESP_LOGW(TAG, "NTP time sync timed out; waiting for valid system year");
             }
-            else if (time_result != ESP_ERR_INVALID_STATE)
+            else
             {
                 ESP_LOGW(TAG, "Cannot start NTP time sync: %s", esp_err_to_name(time_result));
             }
+
+            time_t now = 0;
+            struct tm timeinfo{};
+            for (int attempt = 0; attempt < 20; ++attempt)
+            {
+                time(&now);
+                localtime_r(&now, &timeinfo);
+                if (timeinfo.tm_year >= (2025 - 1900))
+                    break;
+                vTaskDelay(pdMS_TO_TICKS(500));
+            }
+            ESP_LOGI(TAG, "System time year: %d", timeinfo.tm_year + 1900);
         }
 
         // Supervisor loop for dynamic WebSocket client creation and AP portal activation
@@ -2308,11 +2302,20 @@ o.textContent=await r.text();}
                 }
 
                 ESP_LOGI(TAG, "Initializing fresh WebSocket client instance for %s", uri);
+                // esp_websocket_client_config_t ws_config{};
+                // ws_config.uri = uri;
+                // ws_config.headers = headers;
+                // ws_config.buffer_size = 4096;
+                // ws_config.task_stack = 10240;
+                // ws_config.ping_interval_sec = 20;
+                // ws_config.network_timeout_ms = 15000;
+                // ws_config.reconnect_timeout_ms = 5000;
+                // ws_config.disable_auto_reconnect = false;
                 esp_websocket_client_config_t ws_config{};
                 ws_config.uri = uri;
                 ws_config.headers = headers;
-                ws_config.buffer_size = 4096;
-                ws_config.task_stack = 10240;
+                ws_config.buffer_size = 2048;
+                ws_config.task_stack = 6144;
                 ws_config.ping_interval_sec = 20;
                 ws_config.network_timeout_ms = 15000;
                 ws_config.reconnect_timeout_ms = 5000;
@@ -2320,8 +2323,7 @@ o.textContent=await r.text();}
 
                 if (secure_backend)
                 {
-                    ws_config.cert_pem = RENDER_ROOT_CA_PEM;
-                    ws_config.crt_bundle_attach = nullptr;
+                    ws_config.crt_bundle_attach = esp_crt_bundle_attach;
                     ws_config.transport = WEBSOCKET_TRANSPORT_OVER_SSL;
                 }
                 else

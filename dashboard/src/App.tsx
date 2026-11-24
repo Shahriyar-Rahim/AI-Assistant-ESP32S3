@@ -2299,8 +2299,92 @@ function BiometricPage() {
         anti_spoofing: string;
       }>("/api/v1/biometric/status"),
   });
+  const devices = useQuery({
+    queryKey: ["devices"],
+    queryFn: () => fetchJson<{ devices: Device[] }>("/api/v1/devices"),
+  });
+  const [selectedDevice, setSelectedDevice] = useState("esp32");
+  const [isRecording, setIsRecording] = useState(false);
+  const [recordSeconds, setRecordSeconds] = useState(0);
+  const [busy, setBusy] = useState(false);
   const [result, setResult] = useState("");
   const [error, setError] = useState("");
+
+  const physicalDevices =
+    devices.data?.devices.filter((device) => !device.simulated) ?? [];
+  const activeDeviceId =
+    physicalDevices.find((d) => d.device_id === selectedDevice)?.device_id ??
+    physicalDevices[0]?.device_id ??
+    selectedDevice;
+
+  useEffect(() => {
+    if (!isRecording) {
+      setRecordSeconds(0);
+      return;
+    }
+    const timer = window.setInterval(() => {
+      setRecordSeconds((s) => s + 1);
+    }, 1000);
+    return () => window.clearInterval(timer);
+  }, [isRecording]);
+
+  async function startRecording() {
+    if (!activeDeviceId) return;
+    setBusy(true);
+    setError("");
+    setResult("");
+    try {
+      await fetchJson(
+        `/api/v1/biometric/record-device/${encodeURIComponent(activeDeviceId)}/start`,
+        { method: "POST" },
+      );
+      setIsRecording(true);
+    } catch (reason) {
+      setError(
+        reason instanceof Error ? reason.message : "Could not start recording",
+      );
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function finishRecording() {
+    if (!activeDeviceId) return;
+    setBusy(true);
+    setError("");
+    try {
+      const response = await fetchJson<{
+        enrolled: boolean;
+        source_device: string;
+        model: string;
+      }>(
+        `/api/v1/biometric/record-device/${encodeURIComponent(activeDeviceId)}/finish`,
+        { method: "POST" },
+      );
+      setIsRecording(false);
+      setResult(
+        `Master voice enrolled from '${response.source_device}' (${response.model}).`,
+      );
+      await query.refetch();
+    } catch (reason) {
+      setIsRecording(false);
+      setError(
+        reason instanceof Error ? reason.message : "Enrollment failed",
+      );
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function cancelRecording() {
+    setIsRecording(false);
+    setError("");
+    await fetchJson(
+      `/api/v1/biometric/record-device/${encodeURIComponent(activeDeviceId)}/cancel`,
+      { method: "POST" },
+    ).catch(() => {});
+  }
+
   async function submit(
     event: FormEvent<HTMLFormElement>,
     mode: "enroll" | "verify",
@@ -2327,6 +2411,7 @@ function BiometricPage() {
       );
     }
   }
+
   return (
     <>
       <PageHeading
@@ -2335,13 +2420,81 @@ function BiometricPage() {
         description="Embeddings are encrypted; voice similarity is not liveness or replay protection."
       />
       <section className="panel">
+        <div className="panel-heading">
+          <div>
+            <h2>Enroll directly from ESP32-S3</h2>
+            <p>
+              {isRecording
+                ? `Recording from ${activeDeviceId} (${recordSeconds}s) — assistant wake-word is paused. Speak for 4–8 seconds, then click Finish.`
+                : "Click Start Recording to capture your voice directly from the ESP32 microphone without triggering assistant mode."}
+            </p>
+          </div>
+          <span className="protocol-chip">
+            {isRecording ? `REC ${recordSeconds}s` : "Idle"}
+          </span>
+        </div>
+        <div className="form-grid">
+          <label>
+            Target device
+            <select
+              value={activeDeviceId}
+              disabled={isRecording}
+              onChange={(event) => setSelectedDevice(event.target.value)}
+            >
+              {physicalDevices.length > 0 ? (
+                physicalDevices.map((device) => (
+                  <option key={device.device_id} value={device.device_id}>
+                    {device.name} · {device.device_id}
+                  </option>
+                ))
+              ) : (
+                <option value="esp32">esp32</option>
+              )}
+            </select>
+          </label>
+          {!isRecording ? (
+            <button
+              type="button"
+              disabled={busy}
+              onClick={() => void startRecording()}
+            >
+              <Radio size={16} />
+              Enroll from {activeDeviceId}
+            </button>
+          ) : (
+            <div className="button-row">
+              <button
+                type="button"
+                disabled={busy || recordSeconds < 3}
+                onClick={() => void finishRecording()}
+              >
+                {busy
+                  ? "Saving…"
+                  : recordSeconds < 3
+                    ? `Speak (${3 - recordSeconds}s left)…`
+                    : "Finish & Enroll"}
+              </button>
+              <button
+                type="button"
+                className="secondary"
+                disabled={busy}
+                onClick={() => void cancelRecording()}
+              >
+                Cancel
+              </button>
+            </div>
+          )}
+        </div>
+      </section>
+      <section className="panel">
         <p>
           Enrollment: {query.data?.enrolled ? "Configured" : "Not enrolled"} ·
           Threshold: {query.data?.threshold ?? "—"} · Anti-spoofing:{" "}
           {query.data?.anti_spoofing ?? "—"}
         </p>
         <p>
-          Use a clear 3–20 second PCM WAV sample. Audio files are not retained.
+          Or upload a clear 3–20 second PCM WAV sample manually. Audio files are
+          not retained.
         </p>
         <form
           className="form-grid"

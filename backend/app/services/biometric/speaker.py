@@ -37,7 +37,7 @@ def _encoder():
         ) from exc
 
 
-def _audio_array(audio: bytes):
+def _audio_array(audio: bytes, min_seconds: float = 3.0, min_rms: float = 0.005):
     try:
         import numpy as np
     except ImportError as exc:
@@ -52,8 +52,8 @@ def _audio_array(audio: bytes):
         raise ValueError("unsupported WAV channel count or sample width")
     if not 8_000 <= rate <= 96_000:
         raise ValueError("WAV sample rate must be between 8000 and 96000 Hz")
-    if not 3 <= count / rate <= 20:
-        raise ValueError("voice sample must be between 3 and 20 seconds")
+    if not min_seconds <= count / rate <= 20:
+        raise ValueError(f"voice sample must be between {min_seconds} and 20 seconds")
     if width == 1:
         samples = (np.frombuffer(raw, dtype=np.uint8).astype(np.float32) - 128) / 128
     elif width == 2:
@@ -67,9 +67,12 @@ def _audio_array(audio: bytes):
         samples = np.frombuffer(raw, dtype="<i4").astype(np.float32) / 2147483648
     if channels == 2:
         samples = samples.reshape(-1, 2).mean(axis=1)
+    # Remove DC offset (common on I2S MEMS microphones like INMP441)
+    if samples.size > 0:
+        samples = samples - float(np.mean(samples))
     rms = float(np.sqrt(np.mean(np.square(samples))))
     clipped = float(np.mean(np.abs(samples) >= 0.999))
-    if rms < 0.005 or clipped > 0.05:
+    if rms < min_rms or clipped > 0.05:
         raise ValueError("voice sample audio quality is insufficient or clipped")
     target_count = round(len(samples) * 16_000 / rate)
     source_positions = np.arange(len(samples), dtype=np.float64)
@@ -79,7 +82,7 @@ def _audio_array(audio: bytes):
 
 
 def create_enrollment(audio: bytes) -> str:
-    waveform, sample_rate = _audio_array(audio)
+    waveform, sample_rate = _audio_array(audio, min_seconds=3.0, min_rms=0.005)
     import numpy as np
     try:
         from resemblyzer import preprocess_wav
@@ -97,12 +100,16 @@ def create_enrollment(audio: bytes) -> str:
 def compare_voice(audio: bytes, encrypted_embedding: str) -> float:
     from cryptography.fernet import InvalidToken
 
-    waveform, sample_rate = _audio_array(audio)
+    # Allow shorter (0.6s+) and quieter (min_rms=0.0015, ~RMS 50 on int16) live ESP32 utterances
+    waveform, sample_rate = _audio_array(audio, min_seconds=0.6, min_rms=0.0015)
     import numpy as np
     try:
         from resemblyzer import preprocess_wav
+        processed = preprocess_wav(waveform, source_sr=sample_rate)
+        if processed.size < 1600:
+            processed = waveform
         actual = np.asarray(
-            _encoder().embed_utterance(preprocess_wav(waveform, source_sr=sample_rate)),
+            _encoder().embed_utterance(processed),
             dtype=np.float32,
         )
         reference_bytes = _fernet().decrypt(encrypted_embedding.encode())

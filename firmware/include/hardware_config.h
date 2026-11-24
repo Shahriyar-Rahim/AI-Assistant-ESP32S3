@@ -19,10 +19,10 @@ constexpr gpio_num_t DATA_IN = GPIO_NUM_15;
 
 namespace Amplifier {
 constexpr int I2S_PORT = I2S_NUM_1;
-constexpr gpio_num_t BCLK = GPIO_NUM_3;
+constexpr gpio_num_t BCLK = GPIO_NUM_4;
 constexpr gpio_num_t LRC = GPIO_NUM_8;
 constexpr gpio_num_t DATA_OUT = GPIO_NUM_16;
-constexpr gpio_num_t SHUTDOWN = GPIO_NUM_46;
+constexpr gpio_num_t SHUTDOWN = GPIO_NUM_5;
 }
 
 namespace OLED {

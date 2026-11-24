@@ -20,6 +20,7 @@ from app.services.assistant.presenter import go_home_after_reply
 from app.services.schedule_sync import push_schedule, record_fired
 from app.services.audio.framing import AudioFrame, AudioFrameError
 from app.services.audio.vad import VadGate
+from app.services.audio.verification import append_device_recording
 from app.services.assistant.orchestrator import (
     is_echo_guarded,
     process_command_audio,
@@ -100,7 +101,6 @@ async def device_audio(websocket: WebSocket, device_id: str) -> None:
     expected_simulator_token = settings.simulator_token
     is_simulated = bool(expected_simulator_token and hmac.compare_digest(token, expected_simulator_token))
 
-    # Run initial sync DB lookup in an async thread pool to avoid blocking the event loop during handshake
     def authenticate_device():
         with websocket.app.state.db_factory() as db:
             device_record = db.get(Device, device_id)
@@ -123,7 +123,6 @@ async def device_audio(websocket: WebSocket, device_id: str) -> None:
 
     await websocket.accept()
 
-    # Forcefully close any existing active socket for this device ID to prevent ghost connections
     existing_ws = websocket.app.state.device_sockets.get(device_id)
     if existing_ws is not None and existing_ws is not websocket:
         try:
@@ -184,7 +183,6 @@ async def device_audio(websocket: WebSocket, device_id: str) -> None:
                 await process_command_audio(websocket.app, websocket, device_id, pcm)
                 requested_relisten = websocket.app.state.relisten.pop(device_id, False)
                 if requested_relisten or websocket.app.state.device_games.get(device_id):
-                    # A live game continues without requiring the wake word again.
                     vad.reset()
                     command_active = False
                     awaiting_command = True
@@ -229,7 +227,6 @@ async def device_audio(websocket: WebSocket, device_id: str) -> None:
             awaiting_command = True
             command_started_at = time.monotonic()
             if vad.active and not command_active:
-                # Speech already in progress when listening begins belongs to the command.
                 command_active = True
                 awaiting_command = False
             try:
@@ -307,7 +304,6 @@ async def device_audio(websocket: WebSocket, device_id: str) -> None:
             logger.info("Resuming active on-device game after reconnect for %s", device_id)
         websocket.app.state.schedule_hashes.pop(device_id, None)
 
-        # Record connected event in thread pool
         await asyncio.to_thread(
             _record,
             websocket.app.state.db_factory,
@@ -334,7 +330,6 @@ async def device_audio(websocket: WebSocket, device_id: str) -> None:
             },
         })
 
-        # Fetch display config without blocking loop
         def fetch_display_config():
             with websocket.app.state.db_factory() as db:
                 display_configuration = db.get(DisplayConfiguration, device_id)
@@ -409,11 +404,9 @@ async def device_audio(websocket: WebSocket, device_id: str) -> None:
 
                 frame = AudioFrame.decode(message["bytes"], settings.max_audio_frame_bytes)
 
-                # Initialize sequence tracking on first frame
                 if expected_sequence is None:
                     expected_sequence = frame.sequence
 
-                # Diagnostic logging: print audio RMS every 50 frames (~1 sec)
                 if frame.sequence % 50 == 0:
                     logger.info(
                         "Audio Stream Diagnostic - Device: %s, Seq: %d, RMS: %d, Samples: %d",
@@ -455,6 +448,22 @@ async def device_audio(websocket: WebSocket, device_id: str) -> None:
                 last_frame_at = now_monotonic
 
                 if is_echo_guarded(websocket.app, device_id):
+                    await websocket.send_json({
+                        "protocol_version": 1,
+                        "message_id": f"ack-{frame.sequence}",
+                        "device_id": device_id,
+                        "timestamp": datetime.now(timezone.utc).isoformat(),
+                        "type": "audio.ack",
+                        "payload": {"sequence": frame.sequence},
+                    })
+                    continue
+
+                # Manual voice enrollment mode: capture raw PCM and bypass wake-word/assistant mode
+                if append_device_recording(device_id, frame.pcm):
+                    wake_segment.clear()
+                    command_audio.clear()
+                    command_active = False
+                    awaiting_command = False
                     await websocket.send_json({
                         "protocol_version": 1,
                         "message_id": f"ack-{frame.sequence}",
@@ -519,7 +528,6 @@ async def device_audio(websocket: WebSocket, device_id: str) -> None:
                             "payload": {"wake_word": settings.wake_word, "score": score, "sequence": frame.sequence},
                         })
 
-                        # Offload DB audit log to thread pool to prevent blocking frame processing
                         asyncio.create_task(asyncio.to_thread(
                             _record,
                             websocket.app.state.db_factory,
@@ -584,7 +592,6 @@ async def device_audio(websocket: WebSocket, device_id: str) -> None:
                     is_simulated,
                 )
 
-                # Persist last_seen_at asynchronously every 30 seconds
                 if device_record and now_monotonic - last_seen_persisted >= 30:
                     last_seen_persisted = now_monotonic
                     def update_last_seen():
@@ -751,7 +758,6 @@ async def device_audio(websocket: WebSocket, device_id: str) -> None:
                             application.state.ota_progress[(device_id, release_id)] = sample
                             await _publish_telemetry(application, sample)
 
-                    # Offload control message audit logs to thread pool
                     asyncio.create_task(asyncio.to_thread(
                         _record,
                         websocket.app.state.db_factory,
@@ -791,7 +797,6 @@ async def device_audio(websocket: WebSocket, device_id: str) -> None:
         if websocket.app.state.device_sockets.get(device_id) is websocket:
             websocket.app.state.device_sockets.pop(device_id, None)
 
-        # Offload disconnect event audit logging
         asyncio.create_task(asyncio.to_thread(
             _record,
             websocket.app.state.db_factory,

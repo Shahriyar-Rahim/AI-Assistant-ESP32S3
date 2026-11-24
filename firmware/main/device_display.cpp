@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <atomic>
 
 #include "driver/gpio.h"
 #include "driver/i2c_master.h"
@@ -83,6 +84,8 @@ namespace
     lv_obj_t *lv_mouth_line = nullptr;
     lv_point_t lv_mouth_points[3]{};
     DisplayLifecycle display_lifecycle;
+    std::atomic<int> pending_face{-1};
+    std::atomic<uint32_t> pending_speaking_ms{0};
 
     enum class FaceState
     {
@@ -370,8 +373,7 @@ namespace
         for (size_t index = 0; index < MAX_DISPLAY_ITEMS; ++index)
         {
             const size_t row = index < DashboardLayout::visible_items ? index : 0;
-            lv_items[index] = make_label(screen, 3, oled ? 30 :
-                                         DashboardLayout::items_y + static_cast<int>(row) * DashboardLayout::row_height,
+            lv_items[index] = make_label(screen, 3, oled ? 30 : DashboardLayout::items_y + static_cast<int>(row) * DashboardLayout::row_height,
                                          oled ? 121 : DashboardLayout::item_width, lv_color_hex(0xffffff));
             if (!oled && index < DashboardLayout::visible_items)
             {
@@ -465,14 +467,14 @@ namespace
         lv_label_set_text(lv_title, display_model.title.data());
         lv_label_set_text(lv_detail, display_model.detail.data());
         const size_t visible = active_panel == Panel::Oled ? 1 : DashboardLayout::visible_items;
-        const size_t first = active_panel == Panel::Oled ? 0 :
-            DashboardLayout::first_item(display_model.item_count, display_model.animation_frame);
+        const size_t first = active_panel == Panel::Oled ? 0 : DashboardLayout::first_item(display_model.item_count, display_model.animation_frame);
         for (size_t index = 0; index < MAX_DISPLAY_ITEMS; ++index)
         {
             lv_obj_clear_flag(lv_items[index], LV_OBJ_FLAG_HIDDEN);
             const size_t item = first + index;
             lv_label_set_text(lv_items[index], index < visible && item < display_model.item_count
-                                                   ? display_model.items[item].data() : "");
+                                                   ? display_model.items[item].data()
+                                                   : "");
         }
         char counts[48];
         std::snprintf(counts, sizeof(counts), "T:%u R:%u N:%u A:%u", display_model.todos,
@@ -487,56 +489,106 @@ namespace
     {
         switch (static_cast<char>(std::toupper(static_cast<unsigned char>(value))))
         {
-        case 'A': return {2, 5, 7, 5, 5};
-        case 'B': return {6, 5, 6, 5, 6};
-        case 'C': return {3, 4, 4, 4, 3};
-        case 'D': return {6, 5, 5, 5, 6};
-        case 'E': return {7, 4, 6, 4, 7};
-        case 'F': return {7, 4, 6, 4, 4};
-        case 'G': return {3, 4, 5, 5, 3};
-        case 'H': return {5, 5, 7, 5, 5};
-        case 'I': return {7, 2, 2, 2, 7};
-        case 'J': return {1, 1, 1, 5, 2};
-        case 'K': return {5, 5, 6, 5, 5};
-        case 'L': return {4, 4, 4, 4, 7};
-        case 'M': return {5, 7, 7, 5, 5};
-        case 'N': return {5, 7, 7, 7, 5};
-        case 'O': return {2, 5, 5, 5, 2};
-        case 'P': return {6, 5, 6, 4, 4};
-        case 'Q': return {2, 5, 5, 7, 3};
-        case 'R': return {6, 5, 6, 5, 5};
-        case 'S': return {3, 4, 2, 1, 6};
-        case 'T': return {7, 2, 2, 2, 2};
-        case 'U': return {5, 5, 5, 5, 7};
-        case 'V': return {5, 5, 5, 5, 2};
-        case 'W': return {5, 5, 7, 7, 5};
-        case 'X': return {5, 5, 2, 5, 5};
-        case 'Y': return {5, 5, 2, 2, 2};
-        case 'Z': return {7, 1, 2, 4, 7};
-        case '0': return {7, 5, 5, 5, 7};
-        case '1': return {2, 6, 2, 2, 7};
-        case '2': return {6, 1, 2, 4, 7};
-        case '3': return {6, 1, 2, 1, 6};
-        case '4': return {5, 5, 7, 1, 1};
-        case '5': return {7, 4, 6, 1, 6};
-        case '6': return {3, 4, 7, 5, 7};
-        case '7': return {7, 1, 2, 2, 2};
-        case '8': return {7, 5, 2, 5, 7};
-        case '9': return {7, 5, 7, 1, 6};
-        case ':': return {0, 2, 0, 2, 0};
-        case '.': return {0, 0, 0, 0, 2};
-        case '-': return {0, 0, 7, 0, 0};
-        case '/': return {1, 1, 2, 4, 4};
-        case '?': return {6, 1, 2, 0, 2};
-        case '!': return {2, 2, 2, 0, 2};
-        case '_': return {0, 0, 0, 0, 7};
-        case ',': return {0, 0, 0, 2, 4};
-        case '>': return {4, 2, 1, 2, 4};
-        case '<': return {1, 2, 4, 2, 1};
-        case '=': return {0, 7, 0, 7, 0};
-        case '+': return {0, 2, 7, 2, 0};
-        case '\'': return {2, 2, 0, 0, 0};
-        default: return {0, 0, 0, 0, 0};
+        case 'A':
+            return {2, 5, 7, 5, 5};
+        case 'B':
+            return {6, 5, 6, 5, 6};
+        case 'C':
+            return {3, 4, 4, 4, 3};
+        case 'D':
+            return {6, 5, 5, 5, 6};
+        case 'E':
+            return {7, 4, 6, 4, 7};
+        case 'F':
+            return {7, 4, 6, 4, 4};
+        case 'G':
+            return {3, 4, 5, 5, 3};
+        case 'H':
+            return {5, 5, 7, 5, 5};
+        case 'I':
+            return {7, 2, 2, 2, 7};
+        case 'J':
+            return {1, 1, 1, 5, 2};
+        case 'K':
+            return {5, 5, 6, 5, 5};
+        case 'L':
+            return {4, 4, 4, 4, 7};
+        case 'M':
+            return {5, 7, 7, 5, 5};
+        case 'N':
+            return {5, 7, 7, 7, 5};
+        case 'O':
+            return {2, 5, 5, 5, 2};
+        case 'P':
+            return {6, 5, 6, 4, 4};
+        case 'Q':
+            return {2, 5, 5, 7, 3};
+        case 'R':
+            return {6, 5, 6, 5, 5};
+        case 'S':
+            return {3, 4, 2, 1, 6};
+        case 'T':
+            return {7, 2, 2, 2, 2};
+        case 'U':
+            return {5, 5, 5, 5, 7};
+        case 'V':
+            return {5, 5, 5, 5, 2};
+        case 'W':
+            return {5, 5, 7, 7, 5};
+        case 'X':
+            return {5, 5, 2, 5, 5};
+        case 'Y':
+            return {5, 5, 2, 2, 2};
+        case 'Z':
+            return {7, 1, 2, 4, 7};
+        case '0':
+            return {7, 5, 5, 5, 7};
+        case '1':
+            return {2, 6, 2, 2, 7};
+        case '2':
+            return {6, 1, 2, 4, 7};
+        case '3':
+            return {6, 1, 2, 1, 6};
+        case '4':
+            return {5, 5, 7, 1, 1};
+        case '5':
+            return {7, 4, 6, 1, 6};
+        case '6':
+            return {3, 4, 7, 5, 7};
+        case '7':
+            return {7, 1, 2, 2, 2};
+        case '8':
+            return {7, 5, 2, 5, 7};
+        case '9':
+            return {7, 5, 7, 1, 6};
+        case ':':
+            return {0, 2, 0, 2, 0};
+        case '.':
+            return {0, 0, 0, 0, 2};
+        case '-':
+            return {0, 0, 7, 0, 0};
+        case '/':
+            return {1, 1, 2, 4, 4};
+        case '?':
+            return {6, 1, 2, 0, 2};
+        case '!':
+            return {2, 2, 2, 0, 2};
+        case '_':
+            return {0, 0, 0, 0, 7};
+        case ',':
+            return {0, 0, 0, 2, 4};
+        case '>':
+            return {4, 2, 1, 2, 4};
+        case '<':
+            return {1, 2, 4, 2, 1};
+        case '=':
+            return {0, 7, 0, 7, 0};
+        case '+':
+            return {0, 2, 7, 2, 0};
+        case '\'':
+            return {2, 2, 0, 0, 0};
+        default:
+            return {0, 0, 0, 0, 0};
         }
     }
 
@@ -663,10 +715,12 @@ namespace
         const int radius = oled ? 27 : 50;
         const int bob = (display_model.face == FaceState::Listening ||
                          display_model.face == FaceState::Speaking) &&
-                                (display_model.animation_frame / 6) % 2 == 0 ? 1 : 0;
+                                (display_model.animation_frame / 6) % 2 == 0
+                            ? 1
+                            : 0;
         const int y = cy + bob;
-        const uint16_t face = oled ? COLOR_TEXT :
-            display_model.face == FaceState::Error ? 0xF800 : COLOR_FACE;
+        const uint16_t face = oled ? COLOR_TEXT : display_model.face == FaceState::Error ? 0xF800
+                                                                                         : COLOR_FACE;
         const uint16_t features = oled ? COLOR_BACKGROUND : COLOR_FEATURE;
         fill_circle(cx, y, radius, face);
         const int eye_x = oled ? 10 : 20;
@@ -680,9 +734,10 @@ namespace
         else
         {
             const int look = (display_model.face == FaceState::Thinking ||
-                              display_model.face == FaceState::Curious) ? eye_radius / 2 :
-                             display_model.face == FaceState::Idle ?
-                                 static_cast<int>((display_model.animation_frame / 40) % 3) - 1 : 0;
+                              display_model.face == FaceState::Curious)
+                                 ? eye_radius / 2
+                             : display_model.face == FaceState::Idle ? static_cast<int>((display_model.animation_frame / 40) % 3) - 1
+                                                                     : 0;
             fill_circle(cx - eye_x + look, eye_y, eye_radius, features);
             fill_circle(cx + eye_x + look, eye_y, eye_radius, features);
             if (!oled)
@@ -1211,6 +1266,18 @@ namespace
             vTaskDelay(pdMS_TO_TICKS(100));
             if (xSemaphoreTake(display_mutex, pdMS_TO_TICKS(20)) != pdTRUE)
                 continue;
+
+            const int next_face = pending_face.exchange(-1, std::memory_order_acquire);
+            if (next_face >= 0)
+            {
+                display_model.face = static_cast<FaceState>(next_face);
+                const uint32_t speak_ms = pending_speaking_ms.exchange(0, std::memory_order_relaxed);
+                display_model.speaking_until = (display_model.face == FaceState::Speaking && speak_ms > 0)
+                                                   ? (xTaskGetTickCount() + pdMS_TO_TICKS(speak_ms))
+                                                   : 0;
+                display_model.dirty = true;
+            }
+
             const int64_t elapsed_ms = (esp_timer_get_time() - last_lv_tick) / 1000;
             if (lv_display != nullptr && elapsed_ms > 0)
             {
@@ -1298,7 +1365,7 @@ namespace
 
     esp_err_t set_addressing()
     {
-        const uint8_t color_mode = 0x05;  // 16-bit RGB565
+        const uint8_t color_mode = 0x05; // 16-bit RGB565
         const uint8_t orientation = 0x60;
         ESP_RETURN_ON_ERROR(command_data(0x3A, &color_mode, sizeof(color_mode)), TAG, "Cannot set RGB565 mode");
         ESP_RETURN_ON_ERROR(command_data(0x36, &orientation, sizeof(orientation)), TAG, "Cannot set display orientation");
@@ -1397,12 +1464,40 @@ namespace DeviceDisplay
         const uint8_t power_5[] = {0x8A, 0xEE};
         const uint8_t vcom = 0x0E;
         const uint8_t gamma_positive[] = {
-            0x02, 0x1C, 0x07, 0x12, 0x37, 0x32, 0x29, 0x2D,
-            0x29, 0x25, 0x2B, 0x39, 0x00, 0x01, 0x03, 0x10,
+            0x02,
+            0x1C,
+            0x07,
+            0x12,
+            0x37,
+            0x32,
+            0x29,
+            0x2D,
+            0x29,
+            0x25,
+            0x2B,
+            0x39,
+            0x00,
+            0x01,
+            0x03,
+            0x10,
         };
         const uint8_t gamma_negative[] = {
-            0x03, 0x1D, 0x07, 0x06, 0x2E, 0x2C, 0x29, 0x2D,
-            0x2E, 0x2E, 0x37, 0x3F, 0x00, 0x00, 0x02, 0x10,
+            0x03,
+            0x1D,
+            0x07,
+            0x06,
+            0x2E,
+            0x2C,
+            0x29,
+            0x2D,
+            0x2E,
+            0x2E,
+            0x37,
+            0x3F,
+            0x00,
+            0x00,
+            0x02,
+            0x10,
         };
 
         ESP_RETURN_ON_ERROR(command_data(0xB1, frame_rate, sizeof(frame_rate)), TAG, "Cannot set frame rate");
@@ -1458,14 +1553,18 @@ namespace DeviceDisplay
             face = FaceState::Sleeping;
         else if (std::strcmp(state, "idle") != 0)
             return ESP_ERR_INVALID_ARG;
-        if (display_mutex == nullptr || xSemaphoreTake(display_mutex, pdMS_TO_TICKS(100)) != pdTRUE)
-        {
-            return ESP_ERR_TIMEOUT;
-        }
-        display_model.face = face;
-        display_model.speaking_until = 0;
-        display_model.dirty = true;
-        xSemaphoreGive(display_mutex);
+
+        pending_speaking_ms.store(0, std::memory_order_relaxed);
+        pending_face.store(static_cast<int>(face), std::memory_order_release);
+        return ESP_OK;
+    }
+
+    esp_err_t set_speaking_for(uint32_t duration_ms)
+    {
+        if (active_panel == Panel::None || duration_ms == 0)
+            return ESP_ERR_INVALID_ARG;
+        pending_speaking_ms.store(duration_ms, std::memory_order_relaxed);
+        pending_face.store(static_cast<int>(FaceState::Speaking), std::memory_order_release);
         return ESP_OK;
     }
 
@@ -1473,7 +1572,7 @@ namespace DeviceDisplay
     {
         if (display_mutex == nullptr || active_panel == Panel::None)
             return ESP_ERR_INVALID_STATE;
-        if (xSemaphoreTake(display_mutex, pdMS_TO_TICKS(100)) != pdTRUE)
+        if (xSemaphoreTake(display_mutex, pdMS_TO_TICKS(250)) != pdTRUE)
             return ESP_ERR_TIMEOUT;
         display_model.game = view;
         display_model.game_active = true;
@@ -1486,22 +1585,9 @@ namespace DeviceDisplay
     {
         if (display_mutex == nullptr || active_panel == Panel::None)
             return ESP_ERR_INVALID_STATE;
-        if (xSemaphoreTake(display_mutex, pdMS_TO_TICKS(100)) != pdTRUE)
+        if (xSemaphoreTake(display_mutex, pdMS_TO_TICKS(250)) != pdTRUE)
             return ESP_ERR_TIMEOUT;
         display_model.game_active = false;
-        display_model.dirty = true;
-        xSemaphoreGive(display_mutex);
-        return ESP_OK;
-    }
-
-    esp_err_t set_speaking_for(uint32_t duration_ms)
-    {
-        if (display_mutex == nullptr || duration_ms == 0)
-            return ESP_ERR_INVALID_ARG;
-        if (xSemaphoreTake(display_mutex, pdMS_TO_TICKS(100)) != pdTRUE)
-            return ESP_ERR_TIMEOUT;
-        display_model.face = FaceState::Speaking;
-        display_model.speaking_until = xTaskGetTickCount() + pdMS_TO_TICKS(duration_ms);
         display_model.dirty = true;
         xSemaphoreGive(display_mutex);
         return ESP_OK;
@@ -1525,7 +1611,7 @@ namespace DeviceDisplay
         {
             return ESP_ERR_INVALID_ARG;
         }
-        if (xSemaphoreTake(display_mutex, pdMS_TO_TICKS(100)) != pdTRUE)
+        if (xSemaphoreTake(display_mutex, pdMS_TO_TICKS(250)) != pdTRUE)
             return ESP_ERR_TIMEOUT;
         copy_text(display_model.page, page);
         copy_text(display_model.title, title);

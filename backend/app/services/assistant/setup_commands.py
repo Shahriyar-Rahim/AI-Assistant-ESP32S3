@@ -55,24 +55,37 @@ async def route_setup_command(application, websocket, device_id: str, transcript
     """Returns the spoken reply for a setup command, or None when the transcript is something else."""
     if websocket is None or not is_physical_device(application, device_id):
         return None
+        
     lowered = _normalize(transcript)
-    pending = application.state.pending_setup
-    expiry = pending.get(device_id)
-    if expiry is not None:
-        pending.pop(device_id, None)
+    pending = getattr(application.state, "pending_setup", None)
+    
+    if pending is not None and device_id in pending:
+        expiry = pending[device_id]
         if expiry > time.monotonic():
-            if _YES.search(lowered) and not _NO.search(lowered):
+            if _NO.search(lowered):
+                pending.pop(device_id, None)
+                return "Okay, I will keep my setup."
+            if _YES.search(lowered):
+                pending.pop(device_id, None)
                 asyncio.create_task(_send_setup(application, websocket, device_id, "erase_setup"))
                 return ("Erasing my setup now. I will restart and open my setup access point. "
                         "Connect to it from your phone or computer to set me up again.")
-            return "Okay, I will keep my setup."
+        else:
+            # Expired session
+            pending.pop(device_id, None)
+
     if _ERASE.search(lowered):
         logger.info("Erase request recognised for %s", device_id)
+        if pending is None:
+            application.state.pending_setup = {}
+            pending = application.state.pending_setup
         pending[device_id] = time.monotonic() + CONFIRM_SECONDS
         application.state.relisten[device_id] = True
         return "This erases my Wi-Fi and backend setup. Do you want me to erase myself? Say yes to confirm."
+        
     if _PORTAL.search(lowered):
         asyncio.create_task(_send_setup(application, websocket, device_id, "open_portal"))
         return ("Opening my setup access point. I will disconnect from the backend. "
                 "Join the Buddy Setup Wi-Fi and open 192 dot 168 dot 4 dot 1.")
+                
     return None
